@@ -22,6 +22,7 @@ type Env = {
   // Optional owner notifications (e.g. new signups) sent via a separate admin bot.
   ADMIN_BOT_TOKEN?: string;
   ADMIN_CHAT_ID?: string;
+  ADMIN_WEBHOOK_SECRET?: string; // secret token for the admin bot's webhook
   // Optional Terra aggregator (cloud wearables: Oura/Whoop/Garmin/Fitbit…).
   TERRA_DEV_ID?: string;
   TERRA_API_KEY?: string;
@@ -128,6 +129,13 @@ async function tgSendPhoto(env: Env, chatId: number | string, photoUrl: string, 
     body: JSON.stringify({ chat_id: chatId, photo: photoUrl, ...(caption ? { caption } : {}) }),
   });
 }
+async function tgSendAlbum(env: Env, chatId: number | string, photoUrls: string[], caption?: string): Promise<void> {
+  const media = photoUrls.map((url, i) => ({ type: "photo", media: url, ...(i === 0 && caption ? { caption } : {}) }));
+  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMediaGroup`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, media }),
+  });
+}
 
 // ── Gemini ──
 async function gemini(env: Env, system: string, history: { role: string; content: string }[], userText: string): Promise<string> {
@@ -201,6 +209,8 @@ const HELP = [
   "/restart — rebuild your plan",
   "",
   "Or ask me anything (\"should I train today?\") and I'll coach you.",
+  "",
+  "💬 /feedback <message> — send the team your thoughts",
 ].join("\n");
 const WELCOME = "👋 Welcome to Fitpal! I'm your personal fitness coach.\n\nI'll ask a few quick questions to build your plan — about a minute. Ready?";
 
@@ -627,6 +637,15 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
   // ── Onboarded users: commands + coaching ──
   if (text === "/start") { await tgSend(env, chatId, "You're all set! 💪\n\n" + HELP); return; }
   if (text.startsWith("/help")) { await tgSend(env, chatId, HELP); return; }
+  if (text.startsWith("/feedback")) {
+    const fb = text.replace(/^\/feedback\b/i, "").trim();
+    if (!fb) { await tgSend(env, chatId, "Tell me what's on your mind, e.g. /feedback the barcode scan is great, but sleep logging is fiddly."); return; }
+    await sbInsert(env, "feedback", { user_id: userId, message: fb });
+    const prof = await sbGet(env, `profiles?user_id=eq.${userId}&select=nickname`);
+    await notifyAdmin(env, `💬 Feedback from ${prof[0]?.nickname ?? "a user"}:\n${fb}`);
+    await tgSend(env, chatId, "🙏 Thank you — sent straight to the team. We read everything.");
+    return;
+  }
   if (text.startsWith("/restart")) {
     await sbPatch(env, "profiles", `user_id=eq.${userId}`, { onboarding_complete: false });
     await setStep(env, fromId, 1, {});
@@ -710,7 +729,10 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
     if (!q) { await tgSend(env, chatId, "Which exercise? e.g. /demo squat · /demo bench press · /demo lat pulldown"); return; }
     const d = findDemo(q);
     if (d && d.img) {
-      await tgSendPhoto(env, chatId, d.img, `🏋️ ${d.name}\n\n${d.cue}`.slice(0, 1000));
+      const start = d.img, end = d.img.replace(/\/0\.jpg$/, "/1.jpg");
+      const cap = `🏋️ ${d.name} (start → end)\n\n${d.cue}`.slice(0, 1000);
+      if (end !== start) await tgSendAlbum(env, chatId, [start, end], cap);
+      else await tgSendPhoto(env, chatId, start, cap);
     } else {
       const yt = `https://www.youtube.com/results?search_query=${encodeURIComponent("how to " + q + " proper form")}`;
       await tgSend(env, chatId, `I don't have a picture for "${q}", but here's a quick form video:\n${yt}`);
@@ -995,9 +1017,53 @@ async function handleTerraWebhook(request: Request, env: Env): Promise<Response>
   return J({ ok: true, stored });
 }
 
+// Reply to the owner via the admin bot.
+async function adminReply(env: Env, chatId: number | string, text: string): Promise<void> {
+  if (!env.ADMIN_BOT_TOKEN) return;
+  await fetch(`https://api.telegram.org/bot${env.ADMIN_BOT_TOKEN}/sendMessage`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text }),
+  });
+}
+
+// Admin bot webhook: only the owner (ADMIN_CHAT_ID) can broadcast /announcement to all Fitpal users.
+async function handleAdminUpdate(env: Env, update: Record<string, unknown>): Promise<void> {
+  const msg = update.message as { text?: string; from?: { id?: number }; chat?: { id?: number } } | undefined;
+  const text = msg?.text?.trim();
+  const fromId = msg?.from?.id;
+  const chatId = msg?.chat?.id;
+  if (!text || chatId == null) return;
+  if (env.ADMIN_CHAT_ID && String(fromId) !== String(env.ADMIN_CHAT_ID)) { await adminReply(env, chatId, "⛔ Private admin bot."); return; }
+
+  if (/^\/announce(ment)?\b/i.test(text)) {
+    const ann = text.replace(/^\/announce(ment)?\b/i, "").trim();
+    if (!ann) { await adminReply(env, chatId, "Usage: /announcement <message> — broadcasts to every Fitpal user."); return; }
+    const rows = await sbGet(env, `telegram_identities?telegram_chat_id=not.is.null&is_active=eq.true&select=telegram_chat_id`);
+    let sent = 0;
+    for (const r of rows) { const mid = await tgSend(env, r.telegram_chat_id as string, `📢 ${ann}`); if (mid) sent++; }
+    await sbInsert(env, "announcements", { message: ann, sent_count: sent });
+    await adminReply(env, chatId, `✅ Announced to ${sent}/${rows.length} users.`);
+    return;
+  }
+  if (/^\/(start|help)\b/i.test(text)) {
+    await adminReply(env, chatId, "🛠️ HartOS admin bot\n\n/announcement <message> — broadcast to ALL Fitpal users.\n\nYou also get new-signup and /feedback notifications here.");
+    return;
+  }
+  await adminReply(env, chatId, "Unknown command. Use /announcement <message> to broadcast.");
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/admin/webhook") {
+      if (request.headers.get("x-telegram-bot-api-secret-token") !== env.ADMIN_WEBHOOK_SECRET) {
+        return new Response(JSON.stringify({ ok: false }), { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+      let update: Record<string, unknown>;
+      try { update = await request.json(); } catch { return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } }); }
+      try { await handleAdminUpdate(env, update); } catch { /* never 500 */ }
+      return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+    }
     if (request.method === "GET" && url.pathname === "/health") {
       return new Response(JSON.stringify({ ok: true, service: "fitpal-telegram" }), { headers: { "Content-Type": "application/json" } });
     }
