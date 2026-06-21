@@ -14,7 +14,16 @@ export function parseHealthPayload(body: unknown): HealthMetrics {
   const b = body as Record<string, unknown>;
 
   // Simple Shortcut shape: { hrv_ms, resting_hr, sleep_hours, date }
-  const numOf = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : typeof v === "string" && v.trim() && Number.isFinite(Number(v)) ? Number(v) : undefined);
+  // Tolerant: pulls the first number out of strings like "42 ms" / "6.8 hr" so the Shortcut can
+  // dump raw Health values without cleaning them up.
+  const numOf = (v: unknown): number | undefined => {
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string") {
+      const match = v.replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+      if (match && Number.isFinite(Number(match[0]))) return Number(match[0]);
+    }
+    return undefined;
+  };
   out.hrv_ms = numOf(b.hrv_ms) ?? numOf(b.hrv) ?? numOf((b as { heart_rate_variability?: unknown }).heart_rate_variability);
   out.resting_hr = numOf(b.resting_hr) ?? numOf(b.rhr) ?? numOf((b as { resting_heart_rate?: unknown }).resting_heart_rate);
   out.sleep_hours = numOf(b.sleep_hours) ?? numOf(b.sleep) ?? numOf((b as { sleep_analysis?: unknown }).sleep_analysis);

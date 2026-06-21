@@ -13,6 +13,13 @@ describe("parseHealthPayload", () => {
     expect(m.resting_hr).toBe(52);
   });
 
+  it("pulls numbers out of value+unit strings (raw Shortcut output)", () => {
+    const m = parseHealthPayload({ hrv_ms: "42 ms", resting_hr: "54 bpm", sleep_hours: "6.8 hr" });
+    expect(m.hrv_ms).toBe(42);
+    expect(m.resting_hr).toBe(54);
+    expect(m.sleep_hours).toBeCloseTo(6.8);
+  });
+
   it("parses the Auto Health Export metrics shape", () => {
     const m = parseHealthPayload({
       data: {
