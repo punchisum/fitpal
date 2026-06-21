@@ -29,12 +29,21 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook" -H "Content-Type: applicat
 
 ## Commands
 - `/start` — new users: auto-creates account + starts onboarding. Existing: resumes / greets.
-- `/plan` — current plan & targets
+- **📸 send a photo of a meal** — Gemini Vision estimates calories + macros and logs it (`source=photo`)
+- `/food 2 eggs and toast` — log food by text (Gemini estimate, `source=telegram`)
+- `/today` — today's food totals vs your targets
 - `/weight 80.5` — log today's bodyweight
+- `/plan` — current plan & targets
 - `/restart` — rebuild the plan from scratch (re-runs onboarding)
 - `/help` — command list
 - `/link CODE` — (optional) link to an account created on the web dashboard
 - any other text — grounded AI coaching (rate-limited, safety-gated)
+
+## Food logging (`src/worker/food.ts`)
+`estimateFood(apiKey, model, { text | imageBase64 })` calls Gemini (multimodal) and returns
+`{ description, calories, protein_g, carbs_g, fat_g, confidence }` as JSON. Photos are downloaded from
+Telegram (`getFile` → file URL → `toBase64`) and sent inline. Estimates are approximate (confidence flagged).
+Verified by `node scripts/test-food.mjs` (live /food text log + real-photo vision smoke).
 
 Command menu is registered via `setMyCommands` (the ⋮ menu in Telegram).
 

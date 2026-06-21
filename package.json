@@ -24,7 +24,8 @@
     "cf:build": "opennextjs-cloudflare build",
     "cf:deploy": "opennextjs-cloudflare deploy",
     "test:onboarding": "node scripts/test-onboarding.mjs",
-    "test:telegram": "node scripts/test-telegram.mjs"
+    "test:telegram": "node scripts/test-telegram.mjs",
+    "test:food": "node scripts/test-food.mjs"
   },
   "dependencies": {
     "@supabase/ssr": "^0.5.2",

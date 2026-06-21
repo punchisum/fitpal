@@ -5,6 +5,7 @@ import { SAFETY_SYSTEM_PROMPT, detectSafetySignal } from "../../lib/llm/safety";
 import { generatePlan } from "../../lib/plan";
 import type { FitnessPlan } from "../../lib/plan/types";
 import { STEP_COUNT, firstPrompt, promptForStep, parseStep, buildPlanInput, type Answers } from "./onboarding";
+import { estimateFood, toBase64, type FoodEstimate } from "./food";
 
 type Env = {
   TELEGRAM_BOT_TOKEN: string;
@@ -79,7 +80,7 @@ async function gemini(env: Env, system: string, history: { role: string; content
   return j.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("").trim() || "Sorry — could you rephrase?";
 }
 
-const HELP = "Here's what I can do:\n/plan — your plan & targets\n/weight 80.5 — log today's bodyweight\n/restart — rebuild your plan from scratch\n/help — this list\n\nOr just message me anything about training, food, or recovery and I'll coach you.";
+const HELP = "Here's what I can do:\n📸 Send a photo of your meal — I'll log the calories\n/food 2 eggs and toast — log food by text\n/today — today's food vs your targets\n/weight 80.5 — log bodyweight\n/plan — your plan & targets\n/restart — rebuild your plan\n/help — this list\n\nOr just message me anything about training, food, or recovery and I'll coach you.";
 const WELCOME = "👋 Welcome to Fitpal! I'm your personal fitness coach.\n\nI'll ask a few quick questions to build your plan — about a minute. Ready?";
 
 // ── Identity / onboarding state ──
@@ -132,13 +133,70 @@ async function finalizeOnboarding(env: Env, userId: string, answers: Answers): P
   return plan;
 }
 
+// ── Food logging ──
+async function tgFilePath(env: Env, fileId: string): Promise<string | null> {
+  const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`);
+  if (!r.ok) return null;
+  const j = (await r.json()) as { result?: { file_path?: string } };
+  return j.result?.file_path ?? null;
+}
+async function tgDownload(env: Env, filePath: string): Promise<ArrayBuffer | null> {
+  const r = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`);
+  if (!r.ok) return null;
+  return await r.arrayBuffer();
+}
+async function logFood(env: Env, userId: string, m: FoodEstimate, source: "telegram" | "photo"): Promise<boolean> {
+  return sbInsert(env, "nutrition_logs", {
+    user_id: userId, log_date: new Date().toISOString().slice(0, 10),
+    description: m.description, calories: m.calories, protein_g: m.protein_g, carbs_g: m.carbs_g, fat_g: m.fat_g,
+    source, confidence: m.confidence,
+  });
+}
+async function foodSummaryLine(env: Env, userId: string): Promise<string> {
+  const today = new Date().toISOString().slice(0, 10);
+  const rows = await sbGet(env, `nutrition_logs?user_id=eq.${userId}&log_date=eq.${today}&select=calories,protein_g`);
+  const cal = rows.reduce((a, r) => a + Number(r.calories ?? 0), 0);
+  const prot = rows.reduce((a, r) => a + Number(r.protein_g ?? 0), 0);
+  const planRows = await sbGet(env, `fitness_plans?user_id=eq.${userId}&is_active=eq.true&select=plan`);
+  const t = (planRows[0]?.plan as FitnessPlan | undefined)?.targets;
+  return t
+    ? `\n\nToday: ${Math.round(cal)}/${t.calories} kcal · ${Math.round(prot)}/${t.proteinG}g protein (${rows.length} item${rows.length === 1 ? "" : "s"}).`
+    : `\n\nToday: ${Math.round(cal)} kcal · ${Math.round(prot)}g protein.`;
+}
+function foodReply(m: FoodEstimate, summary: string): string {
+  if (m.calories === 0 && /not food/i.test(m.description)) return "That doesn't look like food 🤔 Send a photo of a meal, or try /food <what you ate>.";
+  return `🍽️ Logged: ${m.description} — ~${m.calories} kcal, ${m.protein_g}g protein, ${m.carbs_g}g carbs, ${m.fat_g}g fat (${m.confidence} confidence).${summary}`;
+}
+
 async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<void> {
-  const msg = update.message as { text?: string; chat?: { id: number }; from?: { id: number } } | undefined;
+  const msg = update.message as { text?: string; caption?: string; photo?: { file_id: string }[]; chat?: { id: number }; from?: { id: number } } | undefined;
   const text = msg?.text?.trim();
+  const photos = msg?.photo;
+  const caption = msg?.caption?.trim();
   const chatId = msg?.chat?.id;
   const fromId = msg?.from?.id != null ? String(msg.from.id) : undefined;
-  if (!text || chatId == null || !fromId) return;
+  if (chatId == null || !fromId) return;
   const today = new Date().toISOString().slice(0, 10);
+  const model = env.GEMINI_TEXT_MODEL ?? "gemini-flash-latest";
+
+  // ── Photo of a meal → food log (needs an onboarded account) ──
+  if (photos && photos.length > 0) {
+    const identity = await getIdentity(env, fromId);
+    if (!identity) { await createAccount(env, fromId, chatId); await tgSend(env, chatId, WELCOME + "\n\n" + firstPrompt()); return; }
+    if (!(await isOnboarded(env, identity.user_id))) { await tgSend(env, chatId, "Let's finish your quick setup first — then send food photos anytime. " + promptForStep(identity.onboarding_step || 1)); return; }
+    await tgSend(env, chatId, "📸 Analysing your meal…");
+    const fileId = photos[photos.length - 1].file_id; // largest size
+    const path = await tgFilePath(env, fileId);
+    const buf = path ? await tgDownload(env, path) : null;
+    if (!buf) { await tgSend(env, chatId, "I couldn't download that image — try again, or use /food <what you ate>."); return; }
+    const est = await estimateFood(env.GEMINI_API_KEY, model, { imageBase64: toBase64(buf), text: caption });
+    if (!est) { await tgSend(env, chatId, "I couldn't read that meal — try a clearer photo, or /food <what you ate>."); return; }
+    await logFood(env, identity.user_id, est, "photo");
+    await tgSend(env, chatId, foodReply(est, await foodSummaryLine(env, identity.user_id)));
+    return;
+  }
+
+  if (!text) return;
 
   // GLOBAL safety net — catches ED / self-harm / acute-medical signals at ANY point
   // (onboarding, commands, or coaching). Never reaches the LLM; logs for existing users.
@@ -222,6 +280,19 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
     if (!isFinite(w) || w < 25 || w > 400) { await tgSend(env, chatId, "Send it like: /weight 80.5"); return; }
     const ok = await sbInsert(env, "daily_checkins", { user_id: userId, checkin_date: today, bodyweight_kg: w }, true);
     await tgSend(env, chatId, ok ? `✅ Logged ${w} kg for today.` : "Couldn't save that — try again.");
+    return;
+  }
+  if (text.startsWith("/food")) {
+    const desc = text.slice(5).trim();
+    if (!desc) { await tgSend(env, chatId, "Tell me what you ate, e.g. /food 2 eggs and toast — or just send a photo of your meal 📸"); return; }
+    const est = await estimateFood(env.GEMINI_API_KEY, model, { text: desc });
+    if (!est) { await tgSend(env, chatId, "I couldn't estimate that — try rephrasing, e.g. /food grilled chicken breast and rice."); return; }
+    await logFood(env, userId, est, "telegram");
+    await tgSend(env, chatId, foodReply(est, await foodSummaryLine(env, userId)));
+    return;
+  }
+  if (text.startsWith("/today")) {
+    await tgSend(env, chatId, "📊 Today so far:" + (await foodSummaryLine(env, userId)).replace(/^\n\n/, "\n"));
     return;
   }
 
