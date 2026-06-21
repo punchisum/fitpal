@@ -1,0 +1,32 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# secrets / local env — NEVER COMMIT
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+
+# build / framework
+.next/
+out/
+dist/
+.tmp/
+build/
+
+# infra caches
+.trigger
+.wrangler
+
+# os / editor
+.DS_Store
+*.log
+npm-debug.log*
+.vscode/
+.idea/
+
+# local Claude settings
+.claude/
