@@ -7,6 +7,7 @@ import type { FitnessPlan } from "../../lib/plan/types";
 import { STEP_COUNT, firstPrompt, promptForStep, parseStep, buildPlanInput, type Answers } from "./onboarding";
 import { estimateFood, toBase64, FOOD_MODELS, type FoodEstimate, type FoodItem } from "./food";
 import { computeReadiness } from "../../lib/recovery";
+import { parseHealthPayload } from "./health";
 
 type Env = {
   TELEGRAM_BOT_TOKEN: string;
@@ -143,7 +144,8 @@ const HELP = [
   "/today — today's food, check-in & readiness",
   "/undo — remove your last food log",
   "",
-  "🛌 Daily check-in",
+  "🛌 Recovery & check-in",
+  "/connect — sync Apple Health (HRV, RHR, sleep)",
   "/checkin — guided sleep/energy/soreness/weight",
   "/sleep 7.5 — log last night's sleep",
   "/energy 4 · /soreness 3 · /mood 4 (1–5)",
@@ -178,13 +180,33 @@ async function upsertCheckin(env: Env, userId: string, fields: Record<string, un
   return r.ok;
 }
 
-// Today's readiness one-liner from the stored check-in.
+function avgNums(nums: (number | null | undefined)[]): number | null {
+  const v = nums.filter((n): n is number => typeof n === "number" && Number.isFinite(n));
+  return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
+}
+
+// Today's readiness one-liner — blends wearable HRV/RHR (vs 7-day baseline) with the check-in.
 async function readinessLine(env: Env, userId: string): Promise<string> {
   const today = new Date().toISOString().slice(0, 10);
-  const rows = await sbGet(env, `daily_checkins?user_id=eq.${userId}&checkin_date=eq.${today}&select=sleep_hours,energy,soreness,mood`);
-  const c = rows[0] as { sleep_hours?: number; energy?: number; soreness?: number; mood?: number } | undefined;
-  if (!c) return "";
-  const v = computeReadiness({ sleepHours: c.sleep_hours ?? null, energy: c.energy ?? null, soreness: c.soreness ?? null, mood: c.mood ?? null });
+  const [ckRows, hmRows, baseRows] = await Promise.all([
+    sbGet(env, `daily_checkins?user_id=eq.${userId}&checkin_date=eq.${today}&select=sleep_hours,energy,soreness,mood`),
+    sbGet(env, `health_metrics?user_id=eq.${userId}&metric_date=eq.${today}&select=hrv_ms,resting_hr,sleep_hours`),
+    sbGet(env, `health_metrics?user_id=eq.${userId}&metric_date=gte.${daysAgo(7)}&select=hrv_ms,resting_hr`),
+  ]);
+  const c = ckRows[0] as { sleep_hours?: number; energy?: number; soreness?: number; mood?: number } | undefined;
+  const h = hmRows[0] as { hrv_ms?: number; resting_hr?: number; sleep_hours?: number } | undefined;
+  if (!c && !h) return "";
+  const base = baseRows as { hrv_ms?: number; resting_hr?: number }[];
+  const v = computeReadiness({
+    sleepHours: h?.sleep_hours ?? c?.sleep_hours ?? null,
+    energy: c?.energy ?? null,
+    soreness: c?.soreness ?? null,
+    mood: c?.mood ?? null,
+    hrvMs: h?.hrv_ms ?? null,
+    restingHr: h?.resting_hr ?? null,
+    hrvBaseline: avgNums(base.map((b) => b.hrv_ms)),
+    rhrBaseline: avgNums(base.map((b) => b.resting_hr)),
+  });
   if (v.band === "unknown") return "";
   return `\n\n🧭 ${v.reason}\n${v.directive}`;
 }
@@ -506,6 +528,28 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
     await tgSend(env, chatId, "Okay, let's rebuild your plan from scratch.\n\n" + firstPrompt());
     return;
   }
+  if (text.startsWith("/connect")) {
+    const rows = await sbGet(env, `profiles?user_id=eq.${userId}&select=health_ingest_token`);
+    let token = rows[0]?.health_ingest_token as string | undefined;
+    if (!token) {
+      token = "ht_" + crypto.randomUUID().replace(/-/g, "");
+      await sbPatch(env, "profiles", `user_id=eq.${userId}`, { health_ingest_token: token });
+    }
+    const ingestUrl = `https://fitpal-telegram.hartos.workers.dev/health/ingest?token=${token}`;
+    await tgSend(env, chatId, [
+      "🛰️ Connect Apple Health for real recovery (HRV, resting HR, sleep).",
+      "",
+      "Add the Fitpal Health Sync shortcut on your iPhone, and when it asks, paste this token:",
+      token,
+      "",
+      "It runs each morning and sends last night's data so I judge your recovery from real numbers — not just how you feel.",
+      "",
+      "(Advanced: your personal sync URL is " + ingestUrl + ")",
+      "",
+      "No wearable? /checkin works great too.",
+    ].join("\n"));
+    return;
+  }
   if (text.startsWith("/checkin")) {
     await setCheckinState(env, fromId, 1, {});
     await tgSend(env, chatId, "Let's do your daily check-in 🛌 (send /cancel to stop)\n\n" + CHECKIN_STEPS[0].prompt);
@@ -662,11 +706,40 @@ async function buildGrounding(env: Env, userId: string): Promise<string> {
   return "CONTEXT (this user only):\n" + lines.join("\n");
 }
 
+// Health "satellite" ingest: token-scoped HRV/RHR/sleep from Apple Health (Shortcut / Auto Health Export).
+async function handleHealthIngest(request: Request, env: Env): Promise<Response> {
+  const J = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s, headers: { "Content-Type": "application/json" } });
+  const token = new URL(request.url).searchParams.get("token");
+  if (!token) return J({ ok: false, error: "missing token" }, 401);
+  const userId = await sbRpc<string | null>(env, "resolve_health_token", { p_token: token });
+  if (!userId || typeof userId !== "string") return J({ ok: false, error: "invalid token" }, 401);
+  let body: unknown;
+  try { body = await request.json(); } catch { return J({ ok: false, error: "bad json" }, 400); }
+  const m = parseHealthPayload(body);
+  if (m.hrv_ms == null && m.resting_hr == null && m.sleep_hours == null) return J({ ok: true, stored: false, note: "no recognised metrics" });
+  const date = m.metric_date || new Date().toISOString().slice(0, 10);
+  const r = await fetch(`${env.SUPABASE_URL}/rest/v1/health_metrics?on_conflict=user_id,metric_date`, {
+    method: "POST",
+    headers: { ...sbHeaders(env), Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({
+      user_id: userId, metric_date: date,
+      ...(m.hrv_ms != null ? { hrv_ms: m.hrv_ms } : {}),
+      ...(m.resting_hr != null ? { resting_hr: m.resting_hr } : {}),
+      ...(m.sleep_hours != null ? { sleep_hours: m.sleep_hours } : {}),
+      source: "apple_health", updated_at: new Date().toISOString(),
+    }),
+  });
+  return J({ ok: r.ok, stored: r.ok, date, metrics: m });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") {
       return new Response(JSON.stringify({ ok: true, service: "fitpal-telegram" }), { headers: { "Content-Type": "application/json" } });
+    }
+    if (request.method === "POST" && url.pathname === "/health/ingest") {
+      return handleHealthIngest(request, env);
     }
     if (request.method === "POST" && url.pathname === "/telegram/webhook") {
       if (request.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET) {

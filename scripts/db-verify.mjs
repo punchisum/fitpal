@@ -7,7 +7,7 @@ const EXPECTED = [
   "profiles", "onboarding_responses", "fitness_goals", "training_preferences",
   "fitness_plans", "daily_checkins", "workout_logs", "nutrition_logs",
   "agent_messages", "plan_adjustment_proposals", "telegram_identities",
-  "audit_logs", "usage_counters",
+  "audit_logs", "usage_counters", "health_metrics",
 ];
 
 const client = new pg.Client(dbConfig(loadEnv()));
