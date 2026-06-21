@@ -1,7 +1,17 @@
-// Food estimation via Gemini (text or photo) → calories + macros. Pure (fetch only), Worker-safe.
+// Food estimation via Gemini (text or photo) → itemized breakdown + totals. Pure (fetch only), Worker-safe.
+
+export type FoodItem = {
+  name: string;
+  grams: number;
+  calories: number;
+  protein_g: number;
+  carbs_g: number;
+  fat_g: number;
+};
 
 export type FoodEstimate = {
-  description: string;
+  description: string; // comma-joined item names (or single description)
+  items: FoodItem[];
   calories: number;
   protein_g: number;
   carbs_g: number;
@@ -9,21 +19,21 @@ export type FoodEstimate = {
   confidence: "low" | "medium" | "high";
 };
 
-const FOOD_PROMPT = `You are a precise nutrition estimator for a fitness app. Estimate the TOTAL nutrition for the food described or shown in the image, for the portion implied.
-Respond with ONLY a JSON object, no prose, with exactly these keys:
-{"description": short string, "calories": number (kcal), "protein_g": number, "carbs_g": number, "fat_g": number, "confidence": "low"|"medium"|"high"}
-Use realistic values for typical portions. Estimates are approximate — set confidence by how clear the portion/items are. If the input is NOT food, return calories 0 and description "not food".`;
+const FOOD_PROMPT = `You are a precise nutrition estimator for a fitness app. Identify EACH distinct food/drink item in the description or image, estimate its portion in grams (or ml→grams) and its nutrition, for the portion shown.
+Respond with ONLY a JSON object, no prose:
+{"items":[{"name": short string, "grams": number, "calories": number, "protein_g": number, "carbs_g": number, "fat_g": number}], "confidence": "low"|"medium"|"high"}
+Use realistic values for typical portions. List 1 item if it's a single food. If the input is NOT food, return "items": [].`;
 
 /** Encode an ArrayBuffer to base64 (chunked; Worker + Node safe). */
 export function toBase64(buf: ArrayBuffer): string {
   const bytes = new Uint8Array(buf);
   let binary = "";
   const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
+  for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
   return btoa(binary);
 }
+
+const num = (v: unknown) => Math.max(0, Math.round(Number(v) || 0));
 
 export async function estimateFood(
   apiKey: string,
@@ -44,16 +54,25 @@ export async function estimateFood(
   const raw = j.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
   const cleaned = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
   try {
-    const o = JSON.parse(cleaned) as Record<string, unknown>;
-    if (typeof o.calories !== "number") return null;
-    const num = (v: unknown) => Math.max(0, Math.round(Number(v) || 0));
+    const o = JSON.parse(cleaned) as { items?: unknown[]; confidence?: unknown };
+    const items: FoodItem[] = Array.isArray(o.items)
+      ? o.items.map((raw) => {
+          const it = raw as Record<string, unknown>;
+          return { name: String(it.name || "item").slice(0, 60), grams: num(it.grams), calories: num(it.calories), protein_g: num(it.protein_g), carbs_g: num(it.carbs_g), fat_g: num(it.fat_g) };
+        })
+      : [];
+    if (items.length === 0) {
+      return { description: "not food", items: [], calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0, confidence: "low" };
+    }
+    const sum = (k: keyof FoodItem) => items.reduce((a, i) => a + (i[k] as number), 0);
     const conf = o.confidence === "high" || o.confidence === "medium" ? o.confidence : "low";
     return {
-      description: String(o.description || "food").slice(0, 200),
-      calories: num(o.calories),
-      protein_g: num(o.protein_g),
-      carbs_g: num(o.carbs_g),
-      fat_g: num(o.fat_g),
+      description: items.map((i) => i.name).join(", ").slice(0, 200),
+      items,
+      calories: sum("calories"),
+      protein_g: sum("protein_g"),
+      carbs_g: sum("carbs_g"),
+      fat_g: sum("fat_g"),
       confidence: conf,
     };
   } catch {

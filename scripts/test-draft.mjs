@@ -35,6 +35,7 @@ async function main() {
   const draftId = d[0]?.id;
   const base = Number(d[0]?.calories);
   ok(base > 0, "draft has an estimated calorie value", String(base));
+  ok(Array.isArray(d[0]?.items) && d[0].items.length >= 1 && d[0].items[0].name, "draft has an itemized breakdown", JSON.stringify(d[0]?.items?.[0] ?? {}));
 
   // 2) Adjust +25%.
   await sendCb(`fd:p25:${draftId}`);

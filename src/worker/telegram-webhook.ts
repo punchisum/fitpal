@@ -5,7 +5,7 @@ import { SAFETY_SYSTEM_PROMPT, detectSafetySignal } from "../../lib/llm/safety";
 import { generatePlan } from "../../lib/plan";
 import type { FitnessPlan } from "../../lib/plan/types";
 import { STEP_COUNT, firstPrompt, promptForStep, parseStep, buildPlanInput, type Answers } from "./onboarding";
-import { estimateFood, toBase64, type FoodEstimate } from "./food";
+import { estimateFood, toBase64, type FoodEstimate, type FoodItem } from "./food";
 import { computeReadiness } from "../../lib/recovery";
 
 type Env = {
@@ -249,7 +249,7 @@ async function logFood(env: Env, userId: string, m: FoodEstimate, source: "teleg
   return sbInsert(env, "nutrition_logs", {
     user_id: userId, log_date: new Date().toISOString().slice(0, 10),
     description: m.description, calories: m.calories, protein_g: m.protein_g, carbs_g: m.carbs_g, fat_g: m.fat_g,
-    source, confidence: m.confidence,
+    items: m.items ?? [], source, confidence: m.confidence,
   });
 }
 async function foodSummaryLine(env: Env, userId: string): Promise<string> {
@@ -264,12 +264,21 @@ async function foodSummaryLine(env: Env, userId: string): Promise<string> {
     : `\n\nToday: ${Math.round(cal)} kcal · ${Math.round(prot)}g protein.`;
 }
 function foodReply(m: FoodEstimate, summary: string): string {
-  if (m.calories === 0 && /not food/i.test(m.description)) return "That doesn't look like food 🤔 Send a photo of a meal, or try /food <what you ate>.";
-  return `🍽️ Logged: ${m.description} — ~${m.calories} kcal, ${m.protein_g}g protein, ${m.carbs_g}g carbs, ${m.fat_g}g fat (${m.confidence} confidence).${summary}`;
+  if (!m.items?.length) return "That doesn't look like food 🤔 Send a photo of a meal, or try /food <what you ate>.";
+  const items = m.items.map((i) => `• ${i.name} ~${i.grams}g — ${i.calories} kcal`).join("\n");
+  return `✅ Logged\n${items}\nTotal: ${Math.round(m.calories)} kcal · ${Math.round(m.protein_g)}g protein · ${Math.round(m.carbs_g)}g carbs · ${Math.round(m.fat_g)}g fat (${m.confidence}).${summary}`;
 }
 
 // ── Draft-confirm protocol ──
-type Draft = { id: number; user_id: string; description: string; calories: number; protein_g: number; carbs_g: number; fat_g: number; confidence: string; source: string };
+type Draft = { id: number; user_id: string; description: string; items: FoodItem[]; calories: number; protein_g: number; carbs_g: number; fat_g: number; confidence: string; source: string };
+
+function titleCase(s: string): string { return s ? s[0].toUpperCase() + s.slice(1) : s; }
+function draftText(d: { items: FoodItem[]; calories: number; protein_g: number; carbs_g: number; fat_g: number; confidence: string }, source: string): string {
+  if (!d.items?.length) return "That doesn't look like food 🤔 Send a clear meal photo, or /food <what you ate>.";
+  const header = source === "photo" ? "📝 Draft Nutrition Log — From Photo" : "📝 Draft Nutrition Log — From Text";
+  const lines = d.items.map((i) => `• ${i.name} ~${i.grams}g — ${i.calories} kcal · ${i.protein_g}p ${i.carbs_g}c ${i.fat_g}f`);
+  return `${header}\n🍽 Items\n${lines.join("\n")}\nTotal: ${Math.round(d.calories)} kcal · ${Math.round(d.protein_g)}g protein · ${Math.round(d.carbs_g)}g carbs · ${Math.round(d.fat_g)}g fat\nConfidence: ${titleCase(d.confidence)}\nReview before saving 👇`;
+}
 
 function foodKeyboard(id: number): InlineKeyboard {
   return {
@@ -287,22 +296,17 @@ function foodKeyboard(id: number): InlineKeyboard {
     ],
   };
 }
-function draftText(d: { description: string; calories: number; protein_g: number; carbs_g: number; fat_g: number; confidence: string }): string {
-  if (d.calories === 0 && /not food/i.test(d.description)) return "That doesn't look like food 🤔 Send a clear meal photo, or /food <what you ate>.";
-  return `🍽️ Draft: ${d.description}\n~${Math.round(d.calories)} kcal · ${Math.round(d.protein_g)}g protein · ${Math.round(d.carbs_g)}g carbs · ${Math.round(d.fat_g)}g fat (${d.confidence})\n\nAdjust the calories or confirm 👇`;
-}
-
 async function createDraft(env: Env, userId: string, m: FoodEstimate, source: "telegram" | "photo"): Promise<number | null> {
   const r = await fetch(`${env.SUPABASE_URL}/rest/v1/nutrition_drafts`, {
     method: "POST", headers: { ...sbHeaders(env), Prefer: "return=representation" },
-    body: JSON.stringify({ user_id: userId, description: m.description, calories: m.calories, protein_g: m.protein_g, carbs_g: m.carbs_g, fat_g: m.fat_g, base_calories: m.calories, confidence: m.confidence, source }),
+    body: JSON.stringify({ user_id: userId, description: m.description, items: m.items, calories: m.calories, protein_g: m.protein_g, carbs_g: m.carbs_g, fat_g: m.fat_g, base_calories: m.calories, confidence: m.confidence, source }),
   });
   if (!r.ok) return null;
   const j = (await r.json()) as { id: number }[];
   return j[0]?.id ?? null;
 }
 async function getDraft(env: Env, id: number, userId: string): Promise<Draft | null> {
-  const rows = await sbGet(env, `nutrition_drafts?id=eq.${id}&user_id=eq.${userId}&select=id,user_id,description,calories,protein_g,carbs_g,fat_g,confidence,source&limit=1`);
+  const rows = await sbGet(env, `nutrition_drafts?id=eq.${id}&user_id=eq.${userId}&select=id,user_id,description,items,calories,protein_g,carbs_g,fat_g,confidence,source&limit=1`);
   return (rows[0] as Draft) ?? null;
 }
 async function deleteDraft(env: Env, id: number): Promise<void> {
@@ -323,7 +327,7 @@ async function sendFoodDraft(env: Env, chatId: number, userId: string, est: Food
     if (editMsgId) await tgEdit(env, chatId, editMsgId, t); else await tgSend(env, chatId, t);
     return;
   }
-  const t = draftText(est), kb = foodKeyboard(id);
+  const t = draftText(est, source), kb = foodKeyboard(id);
   if (editMsgId) await tgEdit(env, chatId, editMsgId, t, kb); else await tgSend(env, chatId, t, kb);
 }
 
@@ -346,7 +350,7 @@ async function handleCallback(env: Env, cb: Record<string, unknown>): Promise<vo
   if (!draft) { await tgAnswerCallback(env, cbId, "Draft expired"); await tgEdit(env, chatId, messageId, "⌛ This food draft expired — send it again."); return; }
 
   if (action === "ok") {
-    const est: FoodEstimate = { description: draft.description, calories: Math.round(draft.calories), protein_g: Math.round(draft.protein_g), carbs_g: Math.round(draft.carbs_g), fat_g: Math.round(draft.fat_g), confidence: (draft.confidence as FoodEstimate["confidence"]) ?? "low" };
+    const est: FoodEstimate = { description: draft.description, items: draft.items ?? [], calories: Math.round(draft.calories), protein_g: Math.round(draft.protein_g), carbs_g: Math.round(draft.carbs_g), fat_g: Math.round(draft.fat_g), confidence: (draft.confidence as FoodEstimate["confidence"]) ?? "low" };
     await logFood(env, userId, est, draft.source === "photo" ? "photo" : "telegram");
     await deleteDraft(env, id);
     await tgAnswerCallback(env, cbId, "Logged ✓");
@@ -360,15 +364,12 @@ async function handleCallback(env: Env, cb: Record<string, unknown>): Promise<vo
     return;
   }
   const factor = action === "m50" ? 0.5 : action === "m25" ? 0.75 : action === "p25" ? 1.25 : action === "p50" ? 1.5 : 1;
-  const upd = {
-    calories: Math.max(0, Math.round(draft.calories * factor)),
-    protein_g: Math.max(0, Math.round(draft.protein_g * factor)),
-    carbs_g: Math.max(0, Math.round(draft.carbs_g * factor)),
-    fat_g: Math.max(0, Math.round(draft.fat_g * factor)),
-  };
+  const scale = (n: number) => Math.max(0, Math.round(n * factor));
+  const items: FoodItem[] = (draft.items ?? []).map((i) => ({ name: i.name, grams: i.grams, calories: scale(i.calories), protein_g: scale(i.protein_g), carbs_g: scale(i.carbs_g), fat_g: scale(i.fat_g) }));
+  const upd = { items, calories: scale(draft.calories), protein_g: scale(draft.protein_g), carbs_g: scale(draft.carbs_g), fat_g: scale(draft.fat_g) };
   await sbPatch(env, "nutrition_drafts", `id=eq.${id}`, upd);
   await tgAnswerCallback(env, cbId, `Adjusted ${action.startsWith("m") ? "−" : "+"}${action.slice(1)}%`);
-  await tgEdit(env, chatId, messageId, draftText({ ...draft, ...upd }), foodKeyboard(id));
+  await tgEdit(env, chatId, messageId, draftText({ ...draft, ...upd }, draft.source), foodKeyboard(id));
 }
 
 async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<void> {

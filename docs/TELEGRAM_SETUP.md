@@ -57,11 +57,22 @@ admin bot — keeps owner alerts off the public bot.
 `{ description, calories, protein_g, carbs_g, fat_g, confidence }` as JSON. Photos are downloaded from
 Telegram (`getFile` → file URL → `toBase64`) and sent inline.
 
-**Nothing is logged immediately.** `/food` or a photo creates a row in `nutrition_drafts` and replies with
-inline buttons: `[-50%] [-25%] [+25%] [+50%]` and `[✅ Confirm] [✖ Cancel]`. Adjust buttons scale the draft
-(calories + macros) and `editMessageText` re-renders it; Confirm moves it to `nutrition_logs` and clears the
-draft; Cancel discards it. Requires `allowed_updates: ["message","callback_query"]` on the webhook.
-Verified by `node scripts/test-draft.mjs` (draft → +25% → confirm/cancel) and `test-food.mjs` (+ vision smoke).
+The estimate is **itemized**: `estimateFood` returns `items: [{ name, grams, calories, protein_g, carbs_g,
+fat_g }]` plus summed totals. The draft renders as:
+```
+📝 Draft Nutrition Log — From Photo
+🍽 Items
+• Fried Chicken Chop ~200g — 650 kcal · 45p 30c 45f
+• Potato Wedges ~150g — 300 kcal · 5p 45c 15f
+Total: 950 kcal · 50g protein · 75g carbs · 60g fat
+Confidence: Medium
+Review before saving 👇
+```
+**Nothing is logged immediately.** `/food` or a photo creates a `nutrition_drafts` row (with `items` jsonb)
+and the inline buttons `[-50%] [-25%] [+25%] [+50%]` + `[✅ Confirm] [✖ Cancel]`. Adjust buttons scale the
+totals **and every item** proportionally; `editMessageText` re-renders. Confirm moves it to `nutrition_logs`
+(keeping the `items` breakdown); Cancel discards. Requires `allowed_updates: ["message","callback_query"]`.
+Verified by `node scripts/test-draft.mjs` (draft → itemized → +25% → confirm/cancel) and `test-food.mjs`.
 
 Command menu is registered via `setMyCommands` (the ⋮ menu in Telegram).
 
