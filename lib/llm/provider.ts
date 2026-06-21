@@ -8,7 +8,7 @@ export interface CoachProvider {
 }
 
 const GEMINI_BASE = process.env.GEMINI_BASE_URL ?? "https://generativelanguage.googleapis.com/v1beta";
-const GEMINI_MODEL = process.env.GEMINI_TEXT_MODEL ?? "gemini-flash-latest";
+const GEMINI_MODEL = process.env.GEMINI_TEXT_MODEL ?? "gemini-2.5-flash";
 
 /** Gemini via the Generative Language REST API. Server-only; key never leaves the server. */
 class GeminiProvider implements CoachProvider {

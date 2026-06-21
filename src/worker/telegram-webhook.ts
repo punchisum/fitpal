@@ -5,7 +5,7 @@ import { SAFETY_SYSTEM_PROMPT, detectSafetySignal } from "../../lib/llm/safety";
 import { generatePlan } from "../../lib/plan";
 import type { FitnessPlan } from "../../lib/plan/types";
 import { STEP_COUNT, firstPrompt, promptForStep, parseStep, buildPlanInput, type Answers } from "./onboarding";
-import { estimateFood, toBase64, type FoodEstimate, type FoodItem } from "./food";
+import { estimateFood, toBase64, FOOD_MODELS, type FoodEstimate, type FoodItem } from "./food";
 import { computeReadiness } from "../../lib/recovery";
 
 type Env = {
@@ -111,19 +111,27 @@ async function tgAnswerCallback(env: Env, callbackId: string, text?: string): Pr
 
 // ── Gemini ──
 async function gemini(env: Env, system: string, history: { role: string; content: string }[], userText: string): Promise<string> {
-  const model = env.GEMINI_TEXT_MODEL ?? "gemini-flash-latest";
   const contents = [
     ...history.map((h) => ({ role: h.role === "assistant" ? "model" : "user", parts: [{ text: h.content }] })),
     { role: "user", parts: [{ text: userText }] },
   ];
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents, generationConfig: { temperature: 0.6, maxOutputTokens: 600 } }),
-  });
-  if (!r.ok) return "I'm having trouble reaching my coaching brain right now — try again in a moment.";
-  const j = (await r.json()) as { candidates?: { content?: { parts?: { text?: string }[] } }[]; promptFeedback?: { blockReason?: string } };
-  if (j.promptFeedback?.blockReason) return "I can't help with that one, but I'm happy to help with your training, nutrition, or recovery.";
-  return j.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("").trim() || "Sorry — could you rephrase?";
+  const models = [...new Set([env.GEMINI_TEXT_MODEL ?? "gemini-2.5-flash", ...FOOD_MODELS])];
+  let sawRateLimit = false;
+  for (const model of models) {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents, generationConfig: { temperature: 0.6, maxOutputTokens: 600 } }),
+    });
+    if (r.status === 429) { sawRateLimit = true; continue; } // quota on this model — try the next
+    if (!r.ok) continue;
+    const j = (await r.json()) as { candidates?: { content?: { parts?: { text?: string }[] } }[]; promptFeedback?: { blockReason?: string } };
+    if (j.promptFeedback?.blockReason) return "I can't help with that one, but I'm happy to help with your training, nutrition, or recovery.";
+    const text = j.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("").trim();
+    if (text) return text;
+  }
+  return sawRateLimit
+    ? "🪫 I'm over my coaching limit right now — please try again in a little while."
+    : "I'm having trouble reaching my coaching brain right now — try again in a moment.";
 }
 
 const HELP = [
@@ -381,7 +389,7 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
   const fromId = msg?.from?.id != null ? String(msg.from.id) : undefined;
   if (chatId == null || !fromId) return;
   const today = new Date().toISOString().slice(0, 10);
-  const model = env.GEMINI_TEXT_MODEL ?? "gemini-flash-latest";
+  const model = env.GEMINI_TEXT_MODEL ?? "gemini-2.5-flash";
 
   // ── Photo of a meal → food log (needs an onboarded account) ──
   if (photos && photos.length > 0) {
@@ -393,9 +401,13 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
     const path = await tgFilePath(env, fileId);
     const buf = path ? await tgDownload(env, path) : null;
     if (!buf) { await tgSend(env, chatId, "I couldn't download that image — try again, or use /food <what you ate>."); return; }
-    const est = await estimateFood(env.GEMINI_API_KEY, model, { imageBase64: toBase64(buf), text: caption });
-    if (!est) { await tgSend(env, chatId, "I couldn't read that meal — try a clearer photo, or /food <what you ate>."); return; }
-    await sendFoodDraft(env, chatId, identity.user_id, est, "photo", analysingId);
+    const res = await estimateFood(env.GEMINI_API_KEY, model, { imageBase64: toBase64(buf), text: caption });
+    if (!res.ok) {
+      const msg = res.reason === "rate_limited" ? "🪫 I'm over my food-analysis limit right now — please try again in a little while." : "I couldn't read that meal — try a clearer photo, or /food <what you ate>.";
+      if (analysingId) await tgEdit(env, chatId, analysingId, msg); else await tgSend(env, chatId, msg);
+      return;
+    }
+    await sendFoodDraft(env, chatId, identity.user_id, res.estimate, "photo", analysingId);
     return;
   }
 
@@ -543,9 +555,12 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
   if (text.startsWith("/food") || text.startsWith("/log")) {
     const desc = text.replace(/^\/(food|log)\b/i, "").trim();
     if (!desc) { await tgSend(env, chatId, "Tell me what you ate, e.g. /food 2 eggs and toast — or just send a photo of your meal 📸"); return; }
-    const est = await estimateFood(env.GEMINI_API_KEY, model, { text: desc });
-    if (!est) { await tgSend(env, chatId, "I couldn't estimate that — try rephrasing, e.g. /food grilled chicken breast and rice."); return; }
-    await sendFoodDraft(env, chatId, userId, est, "telegram");
+    const res = await estimateFood(env.GEMINI_API_KEY, model, { text: desc });
+    if (!res.ok) {
+      await tgSend(env, chatId, res.reason === "rate_limited" ? "🪫 I'm over my food-analysis limit right now — please try again in a little while." : "I couldn't estimate that — try rephrasing, e.g. /food grilled chicken breast and rice.");
+      return;
+    }
+    await sendFoodDraft(env, chatId, userId, res.estimate, "telegram");
     return;
   }
   if (text.startsWith("/undo")) {

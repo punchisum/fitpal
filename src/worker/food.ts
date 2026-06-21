@@ -35,22 +35,42 @@ export function toBase64(buf: ArrayBuffer): string {
 
 const num = (v: unknown) => Math.max(0, Math.round(Number(v) || 0));
 
+// Models tried in order. Free-tier daily quotas are per-model, so falling back to the next
+// model when one is exhausted (HTTP 429) keeps food logging working without paid billing.
+export const FOOD_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
+
+/** Result marker so callers can tell "quota exhausted" apart from "couldn't read it". */
+export type FoodResult = { ok: true; estimate: FoodEstimate } | { ok: false; reason: "rate_limited" | "unreadable" };
+
 export async function estimateFood(
   apiKey: string,
   model: string,
   opts: { text?: string; imageBase64?: string; mimeType?: string }
-): Promise<FoodEstimate | null> {
+): Promise<FoodResult> {
   const parts: Record<string, unknown>[] = [{ text: FOOD_PROMPT }];
   if (opts.text) parts.push({ text: "Food: " + opts.text });
   if (opts.imageBase64) parts.push({ inline_data: { mime_type: opts.mimeType ?? "image/jpeg", data: opts.imageBase64 } });
 
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig: { temperature: 0.2, responseMimeType: "application/json" } }),
-  });
-  if (!r.ok) return null;
-  const j = (await r.json()) as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
+  const models = [...new Set([model, ...FOOD_MODELS])];
+  let sawRateLimit = false;
+
+  for (const m of models) {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${apiKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ contents: [{ role: "user", parts }], generationConfig: { temperature: 0.2, responseMimeType: "application/json" } }),
+    });
+    if (r.status === 429) { sawRateLimit = true; continue; } // this model's quota is used up — try the next
+    if (!r.ok) continue;
+    const est = parseFoodResponse(await r.text());
+    if (est) return { ok: true, estimate: est };
+  }
+  return { ok: false, reason: sawRateLimit ? "rate_limited" : "unreadable" };
+}
+
+function parseFoodResponse(body: string): FoodEstimate | null {
+  let j: { candidates?: { content?: { parts?: { text?: string }[] } }[] };
+  try { j = JSON.parse(body); } catch { return null; }
   const raw = j.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
   const cleaned = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
   try {

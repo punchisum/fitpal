@@ -5,6 +5,6 @@
   "compatibility_date": "2025-09-01",
   "observability": { "enabled": true },
   "vars": {
-    "GEMINI_TEXT_MODEL": "gemini-flash-latest"
+    "GEMINI_TEXT_MODEL": "gemini-2.5-flash"
   }
 }
