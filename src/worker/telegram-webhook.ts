@@ -10,6 +10,7 @@ import { computeReadiness } from "../../lib/recovery";
 import { parseHealthPayload } from "./health";
 import { terraWidgetUrl, verifyTerraSignature, parseTerraPayload } from "./terra";
 import { computeAdjustment, applyAdjustment } from "../../lib/plan/adjust";
+import { findDemo } from "./exercises";
 
 type Env = {
   TELEGRAM_BOT_TOKEN: string;
@@ -181,6 +182,7 @@ const HELP = [
   "/food 2 eggs and toast — log by text",
   "/barcode 0123… — scan a packaged food",
   "/again — re-log your last meal",
+  "/menu — what to order when eating out",
   "/today — food, check-in & readiness",
   "/undo — remove your last food log",
   "",
@@ -192,6 +194,7 @@ const HELP = [
   "",
   "📈 Plan & progress",
   "/plan — your plan & targets",
+  "/demo squat — see exercise form 🏋️",
   "/review — let me tune your plan from your results",
   "/chart — your weight trend (image)",
   "/weekly — 7-day review · /streak — your streak 🔥",
@@ -699,7 +702,38 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
     const rows = await sbGet(env, `fitness_plans?user_id=eq.${userId}&is_active=eq.true&select=plan`);
     const p = (rows[0]?.plan as FitnessPlan | undefined);
     if (!p) { await tgSend(env, chatId, "No active plan yet. Send /restart to build one."); return; }
-    await tgSend(env, chatId, planSummary(p));
+    await tgSend(env, chatId, planSummary(p) + "\n\n💡 New to a move? Send /demo <exercise> (e.g. /demo squat) to see the form.");
+    return;
+  }
+  if (text.startsWith("/demo")) {
+    const q = text.replace(/^\/demo\b/i, "").trim();
+    if (!q) { await tgSend(env, chatId, "Which exercise? e.g. /demo squat · /demo bench press · /demo lat pulldown"); return; }
+    const d = findDemo(q);
+    if (d && d.img) {
+      await tgSendPhoto(env, chatId, d.img, `🏋️ ${d.name}\n\n${d.cue}`.slice(0, 1000));
+    } else {
+      const yt = `https://www.youtube.com/results?search_query=${encodeURIComponent("how to " + q + " proper form")}`;
+      await tgSend(env, chatId, `I don't have a picture for "${q}", but here's a quick form video:\n${yt}`);
+    }
+    return;
+  }
+  if (text.startsWith("/menu") || text.startsWith("/eatout")) {
+    const where = text.replace(/^\/(menu|eatout)\b/i, "").trim();
+    const allowed = await sbRpc<boolean>(env, "increment_usage_for", { p_user_id: userId, p_window_key: `chat:${today}`, p_limit: CHAT_DAILY_LIMIT });
+    if (allowed === false) { await tgSend(env, chatId, "You've hit today's coaching limit — it resets tomorrow."); return; }
+    const planRows = await sbGet(env, `fitness_plans?user_id=eq.${userId}&is_active=eq.true&select=plan`);
+    const t = (planRows[0]?.plan as FitnessPlan | undefined)?.targets;
+    const nut = await sbGet(env, `nutrition_logs?user_id=eq.${userId}&log_date=eq.${today}&select=calories,protein_g`);
+    const cal = nut.reduce((a, r) => a + Number(r.calories ?? 0), 0);
+    const prot = nut.reduce((a, r) => a + Number(r.protein_g ?? 0), 0);
+    const remCal = t ? Math.round(t.calories - cal) : null;
+    const remProt = t ? Math.round(t.proteinG - prot) : null;
+    const grounding = await buildGrounding(env, userId);
+    const ask = (where ? `I'm eating out at: ${where}. ` : "I'm about to eat out. ") +
+      (remCal != null ? `I have about ${remCal} kcal and ${remProt} g protein left today. ` : "") +
+      "Recommend a specific order/dish that fits, with rough calories + protein, and one thing to skip. If I didn't say where, ask me where.";
+    const reply = await gemini(env, `${SAFETY_SYSTEM_PROMPT}\n\n${grounding}`, [], ask);
+    await tgSend(env, chatId, reply + "\n\n(Log it after with /food <what you got>.)");
     return;
   }
   if (text.startsWith("/weight")) {
