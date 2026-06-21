@@ -22,7 +22,9 @@
     "guard": "node scripts/check-no-private.mjs",
     "verify": "npm run guard && npm run typecheck && npm run typecheck:trigger && npm run test",
     "cf:build": "opennextjs-cloudflare build",
-    "cf:deploy": "opennextjs-cloudflare deploy"
+    "cf:deploy": "opennextjs-cloudflare deploy",
+    "test:onboarding": "node scripts/test-onboarding.mjs",
+    "test:telegram": "node scripts/test-telegram.mjs"
   },
   "dependencies": {
     "@supabase/ssr": "^0.5.2",
