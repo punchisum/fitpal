@@ -13,7 +13,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, extname } from "node:path";
 
 const ROOT = process.cwd();
-const SKIP_DIRS = new Set(["node_modules", ".next", ".git", ".trigger", ".wrangler", "dist", "out", ".vercel", ".claude"]);
+const SKIP_DIRS = new Set(["node_modules", ".next", ".open-next", ".git", ".trigger", ".wrangler", "dist", "out", ".vercel", ".claude"]);
 const SCAN_EXT = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".sql", ".json", ".md", ".css"]);
 // The guard defines the forbidden patterns, so it would always match itself.
 const SELF = "scripts/check-no-private.mjs";

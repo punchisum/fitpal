@@ -1,10 +1,23 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "fitpal-telegram",
-  "main": "src/worker/telegram-webhook.ts",
-  "compatibility_date": "2025-09-01",
-  "observability": { "enabled": true },
+  "name": "fitpal-web",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2024-12-30",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  "observability": {
+    "enabled": true
+  },
   "vars": {
+    "NEXT_PUBLIC_SUPABASE_URL": "https://mucpuaragugoqqgebjxj.supabase.co",
+    "NEXT_PUBLIC_SUPABASE_ANON_KEY": "sb_publishable_JLEuP0fpZNRJk1mmjA-SUA_xMw3CONI",
+    "NEXT_PUBLIC_APP_URL": "https://fitpal-web.hartos.workers.dev",
+    "APP_URL": "https://fitpal-web.hartos.workers.dev",
     "GEMINI_TEXT_MODEL": "gemini-flash-latest"
   }
 }

@@ -30,3 +30,6 @@ npm-debug.log*
 
 # local Claude settings
 .claude/
+
+# opennext build output
+.open-next/

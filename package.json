@@ -15,12 +15,14 @@
     "db:verify": "node scripts/db-verify.mjs",
     "test:rls": "node scripts/test-rls.mjs",
     "test:flow": "node scripts/test-flow.mjs",
-    "worker:dev": "wrangler dev",
-    "worker:deploy": "wrangler deploy",
+    "worker:dev": "wrangler dev -c wrangler.telegram.jsonc",
+    "worker:deploy": "wrangler deploy -c wrangler.telegram.jsonc",
     "trigger:dev": "trigger.dev dev",
     "trigger:deploy": "trigger.dev deploy",
     "guard": "node scripts/check-no-private.mjs",
-    "verify": "npm run guard && npm run typecheck && npm run typecheck:trigger && npm run test"
+    "verify": "npm run guard && npm run typecheck && npm run typecheck:trigger && npm run test",
+    "cf:build": "opennextjs-cloudflare build",
+    "cf:deploy": "opennextjs-cloudflare deploy"
   },
   "dependencies": {
     "@supabase/ssr": "^0.5.2",
@@ -32,6 +34,7 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@opennextjs/cloudflare": "^1.19.11",
     "@trigger.dev/build": "4.4.6",
     "@trigger.dev/sdk": "4.4.6",
     "@types/node": "^22.10.5",
