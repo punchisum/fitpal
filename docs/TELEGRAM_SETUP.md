@@ -52,11 +52,16 @@ Set Worker secrets `ADMIN_BOT_TOKEN` (e.g. @HartOS_Command_Bot) + `ADMIN_CHAT_ID
 ping on every completed signup (name, goal, plan, total users). No-op if unset. Sent via a separate
 admin bot — keeps owner alerts off the public bot.
 
-## Food logging (`src/worker/food.ts`)
+## Food logging (`src/worker/food.ts`) — draft-confirm protocol
 `estimateFood(apiKey, model, { text | imageBase64 })` calls Gemini (multimodal) and returns
 `{ description, calories, protein_g, carbs_g, fat_g, confidence }` as JSON. Photos are downloaded from
-Telegram (`getFile` → file URL → `toBase64`) and sent inline. Estimates are approximate (confidence flagged).
-Verified by `node scripts/test-food.mjs` (live /food text log + real-photo vision smoke).
+Telegram (`getFile` → file URL → `toBase64`) and sent inline.
+
+**Nothing is logged immediately.** `/food` or a photo creates a row in `nutrition_drafts` and replies with
+inline buttons: `[-50%] [-25%] [+25%] [+50%]` and `[✅ Confirm] [✖ Cancel]`. Adjust buttons scale the draft
+(calories + macros) and `editMessageText` re-renders it; Confirm moves it to `nutrition_logs` and clears the
+draft; Cancel discards it. Requires `allowed_updates: ["message","callback_query"]` on the webhook.
+Verified by `node scripts/test-draft.mjs` (draft → +25% → confirm/cancel) and `test-food.mjs` (+ vision smoke).
 
 Command menu is registered via `setMyCommands` (the ⋮ menu in Telegram).
 

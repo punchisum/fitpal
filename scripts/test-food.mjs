@@ -53,11 +53,16 @@ async function main() {
   await admin.rpc("activate_fitness_plan_for", { p_user_id: userId, p_plan: SAMPLE_PLAN, p_source: "deterministic" });
   await admin.from("telegram_identities").insert({ user_id: userId, telegram_user_id: tgId, telegram_chat_id: tgId, linked_at: new Date().toISOString(), onboarding_step: 0 });
 
-  // 1) /food text through the live Worker.
+  // 1) /food text → draft → confirm → logged (draft-confirm protocol).
   ok((await send("/food two boiled eggs and two slices of toast")) === 200, "/food message processed");
-  await new Promise((r) => setTimeout(r, 1500));
+  await new Promise((r) => setTimeout(r, 1200));
+  const { data: drafts } = await admin.from("nutrition_drafts").select("id, calories").eq("user_id", userId);
+  ok((drafts ?? []).length === 1, "/food creates a draft (not an instant log)");
+  const draftId = drafts?.[0]?.id;
+  const cb = { update_id: 1, callback_query: { id: "cb", from: { id: Number(tgId) }, message: { message_id: 1, chat: { id: Number(tgId) } }, data: `fd:ok:${draftId}` } };
+  await fetch(WORKER, { method: "POST", headers: { "Content-Type": "application/json", "x-telegram-bot-api-secret-token": SECRET }, body: JSON.stringify(cb) });
   const { data: logs } = await admin.from("nutrition_logs").select("calories, protein_g, source, description").eq("user_id", userId);
-  ok((logs ?? []).length >= 1, "food logged to nutrition_logs");
+  ok((logs ?? []).length >= 1, "confirm logs to nutrition_logs");
   ok((logs ?? []).some((l) => Number(l.calories) > 0 && l.source === "telegram"), "logged entry has calories and source=telegram", JSON.stringify(logs?.[0] ?? {}));
 
   // 2) Vision path (direct Gemini, same shape the Worker uses for photos).

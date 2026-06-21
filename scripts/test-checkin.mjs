@@ -56,10 +56,13 @@ async function main() {
   ok((await send("/weight 80.9")) === 200, "/weight logs");
   ok((await send("/weight")) === 200, "/weight (no arg) shows trend without error");
 
-  // Food + /undo
+  // Food (draft → confirm) + /undo
   await send("/food one banana");
+  const dr = (await admin.from("nutrition_drafts").select("id").eq("user_id", userId)).data;
+  ok((dr ?? []).length === 1, "/food creates a draft");
+  await fetch(WORKER, { method: "POST", headers: { "Content-Type": "application/json", "x-telegram-bot-api-secret-token": SECRET }, body: JSON.stringify({ update_id: 1, callback_query: { id: "c", from: { id: Number(tgId) }, message: { message_id: 1, chat: { id: Number(tgId) } }, data: `fd:ok:${dr?.[0]?.id}` } }) });
   let logs = (await admin.from("nutrition_logs").select("id").eq("user_id", userId)).data;
-  ok((logs ?? []).length === 1, "/food logged one item");
+  ok((logs ?? []).length === 1, "confirm logs one item");
   await send("/undo");
   logs = (await admin.from("nutrition_logs").select("id").eq("user_id", userId)).data;
   ok((logs ?? []).length === 0, "/undo removed the food log");

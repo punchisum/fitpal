@@ -26,7 +26,8 @@
     "test:onboarding": "node scripts/test-onboarding.mjs",
     "test:telegram": "node scripts/test-telegram.mjs",
     "test:food": "node scripts/test-food.mjs",
-    "test:checkin": "node scripts/test-checkin.mjs"
+    "test:checkin": "node scripts/test-checkin.mjs",
+    "test:draft": "node scripts/test-draft.mjs"
   },
   "dependencies": {
     "@supabase/ssr": "^0.5.2",

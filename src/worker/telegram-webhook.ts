@@ -86,10 +86,26 @@ async function adminCreateUser(env: Env, email: string, telegramId: string): Pro
 }
 
 // ── Telegram ──
-async function tgSend(env: Env, chatId: number | string, text: string): Promise<void> {
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+type InlineKeyboard = { inline_keyboard: { text: string; callback_data: string }[][] };
+
+async function tgSend(env: Env, chatId: number | string, text: string, replyMarkup?: InlineKeyboard): Promise<number | undefined> {
+  const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
+    body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true, ...(replyMarkup ? { reply_markup: replyMarkup } : {}) }),
+  });
+  const j = (await r.json().catch(() => null)) as { result?: { message_id?: number } } | null;
+  return j?.result?.message_id;
+}
+async function tgEdit(env: Env, chatId: number | string, messageId: number, text: string, replyMarkup?: InlineKeyboard): Promise<void> {
+  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, message_id: messageId, text, ...(replyMarkup ? { reply_markup: replyMarkup } : { reply_markup: { inline_keyboard: [] } }) }),
+  });
+}
+async function tgAnswerCallback(env: Env, callbackId: string, text?: string): Promise<void> {
+  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ callback_query_id: callbackId, ...(text ? { text } : {}) }),
   });
 }
 
@@ -252,6 +268,109 @@ function foodReply(m: FoodEstimate, summary: string): string {
   return `🍽️ Logged: ${m.description} — ~${m.calories} kcal, ${m.protein_g}g protein, ${m.carbs_g}g carbs, ${m.fat_g}g fat (${m.confidence} confidence).${summary}`;
 }
 
+// ── Draft-confirm protocol ──
+type Draft = { id: number; user_id: string; description: string; calories: number; protein_g: number; carbs_g: number; fat_g: number; confidence: string; source: string };
+
+function foodKeyboard(id: number): InlineKeyboard {
+  return {
+    inline_keyboard: [
+      [
+        { text: "-50%", callback_data: `fd:m50:${id}` },
+        { text: "-25%", callback_data: `fd:m25:${id}` },
+        { text: "+25%", callback_data: `fd:p25:${id}` },
+        { text: "+50%", callback_data: `fd:p50:${id}` },
+      ],
+      [
+        { text: "✅ Confirm", callback_data: `fd:ok:${id}` },
+        { text: "✖ Cancel", callback_data: `fd:no:${id}` },
+      ],
+    ],
+  };
+}
+function draftText(d: { description: string; calories: number; protein_g: number; carbs_g: number; fat_g: number; confidence: string }): string {
+  if (d.calories === 0 && /not food/i.test(d.description)) return "That doesn't look like food 🤔 Send a clear meal photo, or /food <what you ate>.";
+  return `🍽️ Draft: ${d.description}\n~${Math.round(d.calories)} kcal · ${Math.round(d.protein_g)}g protein · ${Math.round(d.carbs_g)}g carbs · ${Math.round(d.fat_g)}g fat (${d.confidence})\n\nAdjust the calories or confirm 👇`;
+}
+
+async function createDraft(env: Env, userId: string, m: FoodEstimate, source: "telegram" | "photo"): Promise<number | null> {
+  const r = await fetch(`${env.SUPABASE_URL}/rest/v1/nutrition_drafts`, {
+    method: "POST", headers: { ...sbHeaders(env), Prefer: "return=representation" },
+    body: JSON.stringify({ user_id: userId, description: m.description, calories: m.calories, protein_g: m.protein_g, carbs_g: m.carbs_g, fat_g: m.fat_g, base_calories: m.calories, confidence: m.confidence, source }),
+  });
+  if (!r.ok) return null;
+  const j = (await r.json()) as { id: number }[];
+  return j[0]?.id ?? null;
+}
+async function getDraft(env: Env, id: number, userId: string): Promise<Draft | null> {
+  const rows = await sbGet(env, `nutrition_drafts?id=eq.${id}&user_id=eq.${userId}&select=id,user_id,description,calories,protein_g,carbs_g,fat_g,confidence,source&limit=1`);
+  return (rows[0] as Draft) ?? null;
+}
+async function deleteDraft(env: Env, id: number): Promise<void> {
+  await sbDelete(env, "nutrition_drafts", `id=eq.${id}`);
+}
+
+// Create a draft and present it with the adjust/confirm keyboard (editing an existing message if given).
+async function sendFoodDraft(env: Env, chatId: number, userId: string, est: FoodEstimate, source: "telegram" | "photo", editMsgId?: number): Promise<void> {
+  if (est.calories === 0 && /not food/i.test(est.description)) {
+    const t = "That doesn't look like food 🤔 Send a clear meal photo, or /food <what you ate>.";
+    if (editMsgId) await tgEdit(env, chatId, editMsgId, t); else await tgSend(env, chatId, t);
+    return;
+  }
+  const id = await createDraft(env, userId, est, source);
+  if (!id) { // fallback: log directly so the user is never blocked
+    await logFood(env, userId, est, source);
+    const t = foodReply(est, await foodSummaryLine(env, userId));
+    if (editMsgId) await tgEdit(env, chatId, editMsgId, t); else await tgSend(env, chatId, t);
+    return;
+  }
+  const t = draftText(est), kb = foodKeyboard(id);
+  if (editMsgId) await tgEdit(env, chatId, editMsgId, t, kb); else await tgSend(env, chatId, t, kb);
+}
+
+// Inline-button presses on a food draft: adjust ±%, confirm (log), or cancel.
+async function handleCallback(env: Env, cb: Record<string, unknown>): Promise<void> {
+  const cbId = String(cb.id ?? "");
+  const data = typeof cb.data === "string" ? cb.data : "";
+  const message = cb.message as { chat?: { id: number }; message_id?: number } | undefined;
+  const from = cb.from as { id?: number } | undefined;
+  const chatId = message?.chat?.id;
+  const messageId = message?.message_id;
+  const fromId = from?.id != null ? String(from.id) : undefined;
+  if (!data.startsWith("fd:") || chatId == null || messageId == null || !fromId) { if (cbId) await tgAnswerCallback(env, cbId); return; }
+
+  const [, action, idStr] = data.split(":");
+  const id = Number(idStr);
+  const userId = await sbRpc<string | null>(env, "resolve_telegram_user", { p_telegram_user_id: fromId });
+  if (!userId || typeof userId !== "string") { await tgAnswerCallback(env, cbId, "Please /start first."); return; }
+  const draft = await getDraft(env, id, userId);
+  if (!draft) { await tgAnswerCallback(env, cbId, "Draft expired"); await tgEdit(env, chatId, messageId, "⌛ This food draft expired — send it again."); return; }
+
+  if (action === "ok") {
+    const est: FoodEstimate = { description: draft.description, calories: Math.round(draft.calories), protein_g: Math.round(draft.protein_g), carbs_g: Math.round(draft.carbs_g), fat_g: Math.round(draft.fat_g), confidence: (draft.confidence as FoodEstimate["confidence"]) ?? "low" };
+    await logFood(env, userId, est, draft.source === "photo" ? "photo" : "telegram");
+    await deleteDraft(env, id);
+    await tgAnswerCallback(env, cbId, "Logged ✓");
+    await tgEdit(env, chatId, messageId, foodReply(est, await foodSummaryLine(env, userId)));
+    return;
+  }
+  if (action === "no") {
+    await deleteDraft(env, id);
+    await tgAnswerCallback(env, cbId, "Cancelled");
+    await tgEdit(env, chatId, messageId, "✖ Discarded — nothing logged.");
+    return;
+  }
+  const factor = action === "m50" ? 0.5 : action === "m25" ? 0.75 : action === "p25" ? 1.25 : action === "p50" ? 1.5 : 1;
+  const upd = {
+    calories: Math.max(0, Math.round(draft.calories * factor)),
+    protein_g: Math.max(0, Math.round(draft.protein_g * factor)),
+    carbs_g: Math.max(0, Math.round(draft.carbs_g * factor)),
+    fat_g: Math.max(0, Math.round(draft.fat_g * factor)),
+  };
+  await sbPatch(env, "nutrition_drafts", `id=eq.${id}`, upd);
+  await tgAnswerCallback(env, cbId, `Adjusted ${action.startsWith("m") ? "−" : "+"}${action.slice(1)}%`);
+  await tgEdit(env, chatId, messageId, draftText({ ...draft, ...upd }), foodKeyboard(id));
+}
+
 async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<void> {
   const msg = update.message as { text?: string; caption?: string; photo?: { file_id: string }[]; chat?: { id: number }; from?: { id: number } } | undefined;
   const text = msg?.text?.trim();
@@ -268,15 +387,14 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
     const identity = await getIdentity(env, fromId);
     if (!identity) { await createAccount(env, fromId, chatId); await tgSend(env, chatId, WELCOME + "\n\n" + firstPrompt()); return; }
     if (!(await isOnboarded(env, identity.user_id))) { await tgSend(env, chatId, "Let's finish your quick setup first — then send food photos anytime. " + promptForStep(identity.onboarding_step || 1)); return; }
-    await tgSend(env, chatId, "📸 Analysing your meal…");
+    const analysingId = await tgSend(env, chatId, "📸 Analysing your meal…");
     const fileId = photos[photos.length - 1].file_id; // largest size
     const path = await tgFilePath(env, fileId);
     const buf = path ? await tgDownload(env, path) : null;
     if (!buf) { await tgSend(env, chatId, "I couldn't download that image — try again, or use /food <what you ate>."); return; }
     const est = await estimateFood(env.GEMINI_API_KEY, model, { imageBase64: toBase64(buf), text: caption });
     if (!est) { await tgSend(env, chatId, "I couldn't read that meal — try a clearer photo, or /food <what you ate>."); return; }
-    await logFood(env, identity.user_id, est, "photo");
-    await tgSend(env, chatId, foodReply(est, await foodSummaryLine(env, identity.user_id)));
+    await sendFoodDraft(env, chatId, identity.user_id, est, "photo", analysingId);
     return;
   }
 
@@ -426,8 +544,7 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
     if (!desc) { await tgSend(env, chatId, "Tell me what you ate, e.g. /food 2 eggs and toast — or just send a photo of your meal 📸"); return; }
     const est = await estimateFood(env.GEMINI_API_KEY, model, { text: desc });
     if (!est) { await tgSend(env, chatId, "I couldn't estimate that — try rephrasing, e.g. /food grilled chicken breast and rice."); return; }
-    await logFood(env, userId, est, "telegram");
-    await tgSend(env, chatId, foodReply(est, await foodSummaryLine(env, userId)));
+    await sendFoodDraft(env, chatId, userId, est, "telegram");
     return;
   }
   if (text.startsWith("/undo")) {
@@ -541,7 +658,10 @@ export default {
       }
       let update: Record<string, unknown>;
       try { update = await request.json(); } catch { return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } }); }
-      try { await handleUpdate(env, update); } catch { /* never 500 back to Telegram */ }
+      try {
+        if (update.callback_query) await handleCallback(env, update.callback_query as Record<string, unknown>);
+        else await handleUpdate(env, update);
+      } catch { /* never 500 back to Telegram */ }
       return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
     }
     return new Response(JSON.stringify({ ok: false }), { status: 404, headers: { "Content-Type": "application/json" } });
