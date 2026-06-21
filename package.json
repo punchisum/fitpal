@@ -29,7 +29,10 @@
     "test:checkin": "node scripts/test-checkin.mjs",
     "test:draft": "node scripts/test-draft.mjs",
     "test:health": "node scripts/test-health.mjs",
-    "test:features": "node scripts/test-features.mjs"
+    "test:features": "node scripts/test-features.mjs",
+    "test:admin": "node scripts/test-admin.mjs",
+    "test:coach": "node scripts/test-coach.mjs",
+    "seed:coach": "node scripts/seed-coach.mjs"
   },
   "dependencies": {
     "@supabase/ssr": "^0.5.2",

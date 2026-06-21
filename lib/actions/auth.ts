@@ -12,6 +12,8 @@ async function postAuthPath(): Promise<string> {
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return "/login";
+  const { data: coach } = await supabase.from("coaches").select("user_id").eq("user_id", user.id).maybeSingle();
+  if (coach) return "/coach";
   const { data } = await supabase.from("profiles").select("onboarding_complete").eq("user_id", user.id).maybeSingle();
   return data?.onboarding_complete ? "/dashboard" : "/onboarding";
 }
