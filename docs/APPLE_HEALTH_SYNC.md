@@ -41,8 +41,31 @@ Build once on the iPhone (Shortcuts app → new shortcut):
 
 That's the satellite: every morning it reads last night's numbers and beams them to Fitpal.
 
+## Route C — Cloud wearables via Terra (Oura / Whoop / Garmin / Fitbit / Google Fit) — NO app
+These have real cloud APIs, so the user taps one link and authorizes — no phone app, no Shortcut.
+`/connect` shows a "tap to connect" link when Terra is configured. Built + tested
+(`src/worker/terra.ts`, `terra.test.ts`); webhook is signature-verified and **inert (503) until configured.**
+
+### Activate (owner, ~10 min)
+1. Sign up at **tryterra.co** (free dev tier) → Dashboard → get **dev-id**, **x-api-key**, and a destination **signing secret**.
+2. Add a **webhook destination** in Terra pointing to:
+   `https://fitpal-telegram.hartos.workers.dev/terra-webhook`  (copy that destination's signing secret).
+3. Set Worker secrets (or hand the 3 values to the agent):
+   ```bash
+   printf '%s' "<dev-id>"        | npx wrangler secret put TERRA_DEV_ID         -c wrangler.telegram.jsonc
+   printf '%s' "<x-api-key>"     | npx wrangler secret put TERRA_API_KEY        -c wrangler.telegram.jsonc
+   printf '%s' "<signing-secret>"| npx wrangler secret put TERRA_SIGNING_SECRET -c wrangler.telegram.jsonc
+   ```
+4. Done. `/connect` now shows the watch link; a user taps it → picks Oura/Whoop/etc. → authorizes →
+   Terra webhooks normalized HRV/RHR/sleep to us → recovery uses it. (`reference_id` = the Fitpal user id.)
+
+How it maps: `/connect` calls `POST api.tryterra.co/v2/auth/generateWidgetSession` with
+`reference_id = <user_id>`; the webhook verifies `terra-signature` (HMAC-SHA256 of `t.body`) and reads
+`heart_rate_data.summary.avg_hrv_rmssd` / `resting_hr_bpm` and
+`sleep_durations_data.asleep.duration_asleep_state_seconds`.
+
 ## Notes
 - HRV in Shortcuts is the SDNN sample (ms). Sleep on newer watches splits into stages — summing the
   "Asleep" samples gives total sleep.
 - Recovery still works without any of this — `/checkin` (sleep/energy/soreness) is the universal fallback.
-- Future: Oura/Whoop/Garmin via an aggregator (Terra/Vital) for a no-app, one-tap connect.
+- All three routes write the same `health_metrics` table and feed the same recovery math.

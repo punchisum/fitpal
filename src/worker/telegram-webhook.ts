@@ -8,6 +8,7 @@ import { STEP_COUNT, firstPrompt, promptForStep, parseStep, buildPlanInput, type
 import { estimateFood, toBase64, FOOD_MODELS, type FoodEstimate, type FoodItem } from "./food";
 import { computeReadiness } from "../../lib/recovery";
 import { parseHealthPayload } from "./health";
+import { terraWidgetUrl, verifyTerraSignature, parseTerraPayload } from "./terra";
 
 type Env = {
   TELEGRAM_BOT_TOKEN: string;
@@ -19,6 +20,10 @@ type Env = {
   // Optional owner notifications (e.g. new signups) sent via a separate admin bot.
   ADMIN_BOT_TOKEN?: string;
   ADMIN_CHAT_ID?: string;
+  // Optional Terra aggregator (cloud wearables: Oura/Whoop/Garmin/Fitbit…).
+  TERRA_DEV_ID?: string;
+  TERRA_API_KEY?: string;
+  TERRA_SIGNING_SECRET?: string;
 };
 
 // Notify the owner via a separate admin bot (e.g. @HartOS_Command_Bot). No-op if unconfigured.
@@ -535,19 +540,19 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
       token = "ht_" + crypto.randomUUID().replace(/-/g, "");
       await sbPatch(env, "profiles", `user_id=eq.${userId}`, { health_ingest_token: token });
     }
-    const ingestUrl = `https://fitpal-telegram.hartos.workers.dev/health/ingest?token=${token}`;
+    let watch = "";
+    if (env.TERRA_DEV_ID && env.TERRA_API_KEY) {
+      const url = await terraWidgetUrl(env.TERRA_DEV_ID, env.TERRA_API_KEY, userId);
+      if (url) watch = `\n⌚ Oura / Whoop / Garmin / Fitbit / Google Fit — tap to connect (no app):\n${url}\n`;
+    }
     await tgSend(env, chatId, [
-      "🛰️ Connect Apple Health for real recovery (HRV, resting HR, sleep).",
-      "",
-      "Add the Fitpal Health Sync shortcut on your iPhone, and when it asks, paste this token:",
+      "🛰️ Connect a wearable for real recovery (HRV, resting HR, sleep).",
+      watch,
+      "📱 Apple Health (iPhone) — add the Fitpal Health Sync shortcut, and paste this token when it asks:",
       token,
       "",
-      "It runs each morning and sends last night's data so I judge your recovery from real numbers — not just how you feel.",
-      "",
-      "(Advanced: your personal sync URL is " + ingestUrl + ")",
-      "",
-      "No wearable? /checkin works great too.",
-    ].join("\n"));
+      "Once connected, /today judges your recovery from real data. No wearable? /checkin works great too.",
+    ].filter((l) => l !== "").join("\n"));
     return;
   }
   if (text.startsWith("/checkin")) {
@@ -732,6 +737,37 @@ async function handleHealthIngest(request: Request, env: Env): Promise<Response>
   return J({ ok: r.ok, stored: r.ok, date, metrics: m });
 }
 
+// Terra aggregator webhook — signed; normalized HRV/RHR/sleep from cloud wearables → health_metrics.
+async function handleTerraWebhook(request: Request, env: Env): Promise<Response> {
+  const J = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s, headers: { "Content-Type": "application/json" } });
+  if (!env.TERRA_SIGNING_SECRET || !env.TERRA_DEV_ID) return J({ ok: false, error: "terra not configured" }, 503);
+  const raw = await request.text();
+  if (!(await verifyTerraSignature(env.TERRA_SIGNING_SECRET, request.headers.get("terra-signature"), raw))) {
+    return J({ ok: false, error: "bad signature" }, 401);
+  }
+  let body: unknown;
+  try { body = JSON.parse(raw); } catch { return J({ ok: true }); }
+  const { referenceId, metrics } = parseTerraPayload(body);
+  if (!referenceId || metrics.length === 0) return J({ ok: true, stored: 0 });
+  let stored = 0;
+  for (const m of metrics) {
+    const date = m.metric_date || new Date().toISOString().slice(0, 10);
+    const r = await fetch(`${env.SUPABASE_URL}/rest/v1/health_metrics?on_conflict=user_id,metric_date`, {
+      method: "POST",
+      headers: { ...sbHeaders(env), Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify({
+        user_id: referenceId, metric_date: date,
+        ...(m.hrv_ms != null ? { hrv_ms: m.hrv_ms } : {}),
+        ...(m.resting_hr != null ? { resting_hr: m.resting_hr } : {}),
+        ...(m.sleep_hours != null ? { sleep_hours: m.sleep_hours } : {}),
+        source: "terra", updated_at: new Date().toISOString(),
+      }),
+    });
+    if (r.ok) stored++;
+  }
+  return J({ ok: true, stored });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -740,6 +776,9 @@ export default {
     }
     if (request.method === "POST" && url.pathname === "/health/ingest") {
       return handleHealthIngest(request, env);
+    }
+    if (request.method === "POST" && url.pathname === "/terra-webhook") {
+      return handleTerraWebhook(request, env);
     }
     if (request.method === "POST" && url.pathname === "/telegram/webhook") {
       if (request.headers.get("x-telegram-bot-api-secret-token") !== env.TELEGRAM_WEBHOOK_SECRET) {
