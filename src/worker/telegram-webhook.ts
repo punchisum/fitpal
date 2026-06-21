@@ -6,6 +6,7 @@ import { generatePlan } from "../../lib/plan";
 import type { FitnessPlan } from "../../lib/plan/types";
 import { STEP_COUNT, firstPrompt, promptForStep, parseStep, buildPlanInput, type Answers } from "./onboarding";
 import { estimateFood, toBase64, type FoodEstimate } from "./food";
+import { computeReadiness } from "../../lib/recovery";
 
 type Env = {
   TELEGRAM_BOT_TOKEN: string;
@@ -14,7 +15,31 @@ type Env = {
   SUPABASE_SERVICE_ROLE_KEY: string;
   GEMINI_API_KEY: string;
   GEMINI_TEXT_MODEL?: string;
+  // Optional owner notifications (e.g. new signups) sent via a separate admin bot.
+  ADMIN_BOT_TOKEN?: string;
+  ADMIN_CHAT_ID?: string;
 };
+
+// Notify the owner via a separate admin bot (e.g. @HartOS_Command_Bot). No-op if unconfigured.
+async function notifyAdmin(env: Env, text: string): Promise<void> {
+  if (!env.ADMIN_BOT_TOKEN || !env.ADMIN_CHAT_ID) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${env.ADMIN_BOT_TOKEN}/sendMessage`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: env.ADMIN_CHAT_ID, text, disable_web_page_preview: true }),
+    });
+  } catch { /* never let admin notify break the user flow */ }
+}
+
+// Count of fully-onboarded users (for the signup notification).
+async function onboardedCount(env: Env): Promise<number | null> {
+  const r = await fetch(`${env.SUPABASE_URL}/rest/v1/profiles?onboarding_complete=eq.true&select=user_id`, {
+    headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`, Prefer: "count=exact", Range: "0-0" },
+  });
+  const cr = r.headers.get("content-range"); // e.g. "0-0/42"
+  const total = cr?.split("/")?.[1];
+  return total ? Number(total) : null;
+}
 
 const CHAT_DAILY_LIMIT = 40;
 
@@ -37,6 +62,11 @@ async function sbPatch(env: Env, table: string, filter: string, body: Record<str
   const r = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}?${filter}`, { method: "PATCH", headers: { ...sbHeaders(env), Prefer: "return=minimal" }, body: JSON.stringify(body) });
   return r.ok;
 }
+async function sbDelete(env: Env, table: string, filter: string): Promise<boolean> {
+  const r = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}?${filter}`, { method: "DELETE", headers: { ...sbHeaders(env), Prefer: "return=minimal" } });
+  return r.ok;
+}
+function daysAgo(n: number): string { const d = new Date(); d.setUTCDate(d.getUTCDate() - n); return d.toISOString().slice(0, 10); }
 async function sbRpc<T>(env: Env, fn: string, body: Record<string, unknown>): Promise<T | null> {
   const r = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/${fn}`, { method: "POST", headers: sbHeaders(env), body: JSON.stringify(body) });
   if (!r.ok) return null;
@@ -80,15 +110,69 @@ async function gemini(env: Env, system: string, history: { role: string; content
   return j.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("").trim() || "Sorry — could you rephrase?";
 }
 
-const HELP = "Here's what I can do:\n📸 Send a photo of your meal — I'll log the calories\n/food 2 eggs and toast — log food by text\n/today — today's food vs your targets\n/weight 80.5 — log bodyweight\n/plan — your plan & targets\n/restart — rebuild your plan\n/help — this list\n\nOr just message me anything about training, food, or recovery and I'll coach you.";
+const HELP = [
+  "Here's what I can do:",
+  "",
+  "🍽️ Food",
+  "📸 Send a meal photo — I'll log the calories",
+  "/food 2 eggs and toast — log food by text",
+  "/today — today's food, check-in & readiness",
+  "/undo — remove your last food log",
+  "",
+  "🛌 Daily check-in",
+  "/checkin — guided sleep/energy/soreness/weight",
+  "/sleep 7.5 — log last night's sleep",
+  "/energy 4 · /soreness 3 · /mood 4 (1–5)",
+  "/weight 80.5 — log bodyweight",
+  "",
+  "📈 Plan & progress",
+  "/plan — your plan & targets",
+  "/weekly — your 7-day review",
+  "/restart — rebuild your plan",
+  "",
+  "Or ask me anything (\"should I train today?\") and I'll coach you.",
+].join("\n");
 const WELCOME = "👋 Welcome to Fitpal! I'm your personal fitness coach.\n\nI'll ask a few quick questions to build your plan — about a minute. Ready?";
 
 // ── Identity / onboarding state ──
-type Identity = { user_id: string; onboarding_step: number; onboarding_answers: Answers };
+type Identity = { user_id: string; onboarding_step: number; onboarding_answers: Answers; checkin_step: number; checkin_answers: Answers };
 async function getIdentity(env: Env, fromId: string): Promise<Identity | null> {
-  const rows = await sbGet(env, `telegram_identities?telegram_user_id=eq.${fromId}&select=user_id,onboarding_step,onboarding_answers&limit=1`);
+  const rows = await sbGet(env, `telegram_identities?telegram_user_id=eq.${fromId}&select=user_id,onboarding_step,onboarding_answers,checkin_step,checkin_answers&limit=1`);
   return (rows[0] as Identity) ?? null;
 }
+async function setCheckinState(env: Env, fromId: string, step: number, answers: Answers): Promise<void> {
+  await sbPatch(env, "telegram_identities", `telegram_user_id=eq.${fromId}`, { checkin_step: step, checkin_answers: answers });
+}
+
+// Upsert today's check-in (merge — only the provided fields change).
+async function upsertCheckin(env: Env, userId: string, fields: Record<string, unknown>): Promise<boolean> {
+  const r = await fetch(`${env.SUPABASE_URL}/rest/v1/daily_checkins?on_conflict=user_id,checkin_date`, {
+    method: "POST",
+    headers: { ...sbHeaders(env), Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({ user_id: userId, checkin_date: new Date().toISOString().slice(0, 10), ...fields }),
+  });
+  return r.ok;
+}
+
+// Today's readiness one-liner from the stored check-in.
+async function readinessLine(env: Env, userId: string): Promise<string> {
+  const today = new Date().toISOString().slice(0, 10);
+  const rows = await sbGet(env, `daily_checkins?user_id=eq.${userId}&checkin_date=eq.${today}&select=sleep_hours,energy,soreness,mood`);
+  const c = rows[0] as { sleep_hours?: number; energy?: number; soreness?: number; mood?: number } | undefined;
+  if (!c) return "";
+  const v = computeReadiness({ sleepHours: c.sleep_hours ?? null, energy: c.energy ?? null, soreness: c.soreness ?? null, mood: c.mood ?? null });
+  if (v.band === "unknown") return "";
+  return `\n\n🧭 ${v.reason}\n${v.directive}`;
+}
+
+// ── /checkin guided flow ──
+const CHECKIN_STEPS: { key: string; prompt: string; parse: (t: string) => { ok: true; value: unknown } | { ok: false; error: string } }[] = [
+  { key: "sleep_hours", prompt: "🌙 How many hours did you sleep last night? (e.g. 7.5)", parse: (t) => { const n = parseFloat(t.replace(/[^\d.]/g, "")); return Number.isFinite(n) && n >= 0 && n <= 24 ? { ok: true, value: n } : { ok: false, error: "Reply with hours, e.g. 7.5" }; } },
+  { key: "energy", prompt: "⚡ Energy today? 1 (drained) – 5 (great)", parse: (t) => { const n = parseInt(t, 10); return n >= 1 && n <= 5 ? { ok: true, value: n } : { ok: false, error: "Reply 1–5." }; } },
+  { key: "soreness", prompt: "💪 Soreness? 1 (none) – 5 (very sore)", parse: (t) => { const n = parseInt(t, 10); return n >= 1 && n <= 5 ? { ok: true, value: n } : { ok: false, error: "Reply 1–5." }; } },
+  { key: "mood", prompt: "🙂 Mood? 1 (low) – 5 (great)", parse: (t) => { const n = parseInt(t, 10); return n >= 1 && n <= 5 ? { ok: true, value: n } : { ok: false, error: "Reply 1–5." }; } },
+  { key: "bodyweight_kg", prompt: "⚖️ Bodyweight in kg? (or reply 'skip')", parse: (t) => { if (/^skip$/i.test(t.trim())) return { ok: true, value: null }; const n = parseFloat(t.replace(/[^\d.]/g, "")); return Number.isFinite(n) && n >= 25 && n <= 400 ? { ok: true, value: n } : { ok: false, error: "Reply with kg, e.g. 80.5, or 'skip'." }; } },
+];
 async function isOnboarded(env: Env, userId: string): Promise<boolean> {
   const rows = await sbGet(env, `profiles?user_id=eq.${userId}&select=onboarding_complete&limit=1`);
   return rows[0]?.onboarding_complete === true;
@@ -249,6 +333,8 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
       await tgSend(env, chatId, "Perfect — building your plan now… 🛠️");
       const plan = await finalizeOnboarding(env, userId, answers);
       await setStep(env, fromId, 0, {});
+      const total = await onboardedCount(env);
+      await notifyAdmin(env, `🆕 New Fitpal signup\nName: ${answers.nickname}\nGoal: ${plan.goal}\nPlan: ${plan.targets.calories} kcal · ${plan.targets.proteinG}g protein · ${plan.training.daysPerWeek}×/wk${total != null ? `\nTotal users: ${total}` : ""}`);
       await tgSend(env, chatId, planSummary(plan));
       if (plan.safetyFlags.length) await tgSend(env, chatId, "⚠️ Fitpal gives general fitness guidance, not medical advice. For injuries, illness, or eating concerns, please talk to a qualified professional.");
       await tgSend(env, chatId, "You're all set! 💪\n\n" + HELP);
@@ -256,6 +342,27 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
     }
     await setStep(env, fromId, step + 1, answers);
     await tgSend(env, chatId, promptForStep(step + 1));
+    return;
+  }
+
+  // ── Mid /checkin flow → interpret as the answer to the current question ──
+  if (identity.checkin_step && identity.checkin_step > 0) {
+    if (text === "/cancel") { await setCheckinState(env, fromId, 0, {}); await tgSend(env, chatId, "Check-in cancelled."); return; }
+    const cstep = identity.checkin_step;
+    const def = CHECKIN_STEPS[cstep - 1];
+    const r = def.parse(text);
+    if (!r.ok) { await tgSend(env, chatId, r.error); return; }
+    const answers: Answers = { ...(identity.checkin_answers || {}), [def.key]: r.value };
+    if (cstep >= CHECKIN_STEPS.length) {
+      const fields: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(answers)) if (v !== null && v !== undefined) fields[k] = v;
+      await upsertCheckin(env, userId, fields);
+      await setCheckinState(env, fromId, 0, {});
+      await tgSend(env, chatId, "✅ Check-in saved!" + (await readinessLine(env, userId)));
+      return;
+    }
+    await setCheckinState(env, fromId, cstep + 1, answers);
+    await tgSend(env, chatId, CHECKIN_STEPS[cstep].prompt);
     return;
   }
 
@@ -268,6 +375,27 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
     await tgSend(env, chatId, "Okay, let's rebuild your plan from scratch.\n\n" + firstPrompt());
     return;
   }
+  if (text.startsWith("/checkin")) {
+    await setCheckinState(env, fromId, 1, {});
+    await tgSend(env, chatId, "Let's do your daily check-in 🛌 (send /cancel to stop)\n\n" + CHECKIN_STEPS[0].prompt);
+    return;
+  }
+  if (text.startsWith("/sleep")) {
+    const n = parseFloat((text.split(/\s+/)[1] ?? "").replace(/[^\d.]/g, ""));
+    if (!isFinite(n) || n < 0 || n > 24) { await tgSend(env, chatId, "Send it like: /sleep 7.5"); return; }
+    await upsertCheckin(env, userId, { sleep_hours: n });
+    await tgSend(env, chatId, `✅ Logged ${n}h sleep.` + (await readinessLine(env, userId)));
+    return;
+  }
+  for (const [cmd, key, label] of [["/energy", "energy", "energy"], ["/soreness", "soreness", "soreness"], ["/mood", "mood", "mood"]] as const) {
+    if (text.startsWith(cmd)) {
+      const n = parseInt(text.split(/\s+/)[1] ?? "", 10);
+      if (!(n >= 1 && n <= 5)) { await tgSend(env, chatId, `Send it like: ${cmd} 4  (1–5)`); return; }
+      await upsertCheckin(env, userId, { [key]: n });
+      await tgSend(env, chatId, `✅ Logged ${label} ${n}/5.` + (await readinessLine(env, userId)));
+      return;
+    }
+  }
   if (text.startsWith("/plan")) {
     const rows = await sbGet(env, `fitness_plans?user_id=eq.${userId}&is_active=eq.true&select=plan`);
     const p = (rows[0]?.plan as FitnessPlan | undefined);
@@ -276,14 +404,25 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
     return;
   }
   if (text.startsWith("/weight")) {
-    const w = parseFloat(text.split(/\s+/)[1] ?? "");
+    const arg = text.split(/\s+/)[1];
+    if (!arg) { // no number → weight trend
+      const rows = await sbGet(env, `daily_checkins?user_id=eq.${userId}&bodyweight_kg=not.is.null&select=checkin_date,bodyweight_kg&order=checkin_date.desc&limit=10`);
+      if (!rows.length) { await tgSend(env, chatId, "No weight logged yet. Send /weight 80.5"); return; }
+      const series = (rows as { checkin_date: string; bodyweight_kg: number }[]).reverse();
+      const first = series[0], last = series[series.length - 1];
+      const delta = Number((last.bodyweight_kg - first.bodyweight_kg).toFixed(1));
+      const lines = series.slice(-7).map((s) => `${s.checkin_date.slice(5)}: ${s.bodyweight_kg} kg`).join("\n");
+      await tgSend(env, chatId, `⚖️ Weight trend (${series.length} weigh-ins):\n${lines}\n\nChange: ${delta > 0 ? "+" : ""}${delta} kg`);
+      return;
+    }
+    const w = parseFloat(arg);
     if (!isFinite(w) || w < 25 || w > 400) { await tgSend(env, chatId, "Send it like: /weight 80.5"); return; }
-    const ok = await sbInsert(env, "daily_checkins", { user_id: userId, checkin_date: today, bodyweight_kg: w }, true);
-    await tgSend(env, chatId, ok ? `✅ Logged ${w} kg for today.` : "Couldn't save that — try again.");
+    await upsertCheckin(env, userId, { bodyweight_kg: w });
+    await tgSend(env, chatId, `✅ Logged ${w} kg.`);
     return;
   }
-  if (text.startsWith("/food")) {
-    const desc = text.slice(5).trim();
+  if (text.startsWith("/food") || text.startsWith("/log")) {
+    const desc = text.replace(/^\/(food|log)\b/i, "").trim();
     if (!desc) { await tgSend(env, chatId, "Tell me what you ate, e.g. /food 2 eggs and toast — or just send a photo of your meal 📸"); return; }
     const est = await estimateFood(env.GEMINI_API_KEY, model, { text: desc });
     if (!est) { await tgSend(env, chatId, "I couldn't estimate that — try rephrasing, e.g. /food grilled chicken breast and rice."); return; }
@@ -291,8 +430,60 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
     await tgSend(env, chatId, foodReply(est, await foodSummaryLine(env, userId)));
     return;
   }
+  if (text.startsWith("/undo")) {
+    const rows = await sbGet(env, `nutrition_logs?user_id=eq.${userId}&select=id,description&order=created_at.desc&limit=1`);
+    if (!rows.length) { await tgSend(env, chatId, "Nothing to undo."); return; }
+    await sbDelete(env, "nutrition_logs", `id=eq.${rows[0].id}`);
+    await tgSend(env, chatId, `↩️ Removed: ${rows[0].description ?? "last food log"}.${await foodSummaryLine(env, userId)}`);
+    return;
+  }
   if (text.startsWith("/today")) {
-    await tgSend(env, chatId, "📊 Today so far:" + (await foodSummaryLine(env, userId)).replace(/^\n\n/, "\n"));
+    const ciRows = await sbGet(env, `daily_checkins?user_id=eq.${userId}&checkin_date=eq.${today}&select=sleep_hours,energy,bodyweight_kg`);
+    const ci = ciRows[0] as { sleep_hours?: number; energy?: number; bodyweight_kg?: number } | undefined;
+    let body = "📊 Today" + (await foodSummaryLine(env, userId));
+    if (ci) {
+      const bits = [ci.sleep_hours ? `${ci.sleep_hours}h sleep` : "", ci.energy ? `energy ${ci.energy}/5` : "", ci.bodyweight_kg ? `${ci.bodyweight_kg}kg` : ""].filter(Boolean);
+      if (bits.length) body += `\n\nCheck-in: ${bits.join(" · ")}`;
+    } else {
+      body += "\n\nNo check-in yet — /checkin or /sleep 7.5";
+    }
+    body += await readinessLine(env, userId);
+    await tgSend(env, chatId, body);
+    return;
+  }
+  if (text.startsWith("/weekly") || text.startsWith("/week")) {
+    const wAgo = daysAgo(7);
+    const [wk, sl, nut, wt] = await Promise.all([
+      sbGet(env, `workout_logs?user_id=eq.${userId}&workout_date=gte.${wAgo}&select=id`),
+      sbGet(env, `daily_checkins?user_id=eq.${userId}&checkin_date=gte.${wAgo}&sleep_hours=not.is.null&select=sleep_hours`),
+      sbGet(env, `nutrition_logs?user_id=eq.${userId}&log_date=gte.${wAgo}&select=calories,log_date`),
+      sbGet(env, `daily_checkins?user_id=eq.${userId}&bodyweight_kg=not.is.null&checkin_date=gte.${daysAgo(14)}&select=bodyweight_kg,checkin_date&order=checkin_date.asc`),
+    ]);
+    const sleeps = (sl as { sleep_hours: number }[]).map((s) => s.sleep_hours);
+    const avgSleep = sleeps.length ? (sleeps.reduce((a, b) => a + b, 0) / sleeps.length).toFixed(1) : null;
+    const byDay = new Map<string, number>();
+    for (const n of nut as { calories: number; log_date: string }[]) byDay.set(n.log_date, (byDay.get(n.log_date) ?? 0) + Number(n.calories ?? 0));
+    const avgCals = byDay.size ? Math.round([...byDay.values()].reduce((a, b) => a + b, 0) / byDay.size) : null;
+    const wseries = wt as { bodyweight_kg: number }[];
+    const wDelta = wseries.length >= 2 ? Number((wseries[wseries.length - 1].bodyweight_kg - wseries[0].bodyweight_kg).toFixed(1)) : null;
+    const lines = [
+      "📊 Your 7-day review:",
+      `• Workouts logged: ${wk.length}`,
+      avgSleep ? `• Avg sleep: ${avgSleep}h` : "• Sleep: log it with /sleep",
+      avgCals ? `• Avg calories: ${avgCals}/day` : "• Food: log meals to track calories",
+      wDelta != null ? `• Bodyweight change (2 wks): ${wDelta > 0 ? "+" : ""}${wDelta} kg` : "• Weigh in a couple times to see the trend",
+      "",
+      wk.length >= 3 ? "Strong week 💪 keep the streak going." : "Aim for a couple more sessions next week — consistency wins.",
+    ];
+    await tgSend(env, chatId, lines.join("\n"));
+    return;
+  }
+
+  // "Should I train today?" → deterministic readiness (mirrors HartOS: verdict is computed, not guessed).
+  if (/\b(should i (train|rest|work\s?out)|train today|am i recovered|ready to train|rest today)\b/i.test(text)) {
+    const line = await readinessLine(env, userId);
+    if (line) { await tgSend(env, chatId, line.replace(/^\n\n/, "")); return; }
+    await tgSend(env, chatId, "I don't have today's check-in yet — run /checkin (or /sleep 7.5) and I'll call your readiness.");
     return;
   }
 
@@ -311,19 +502,30 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
 }
 
 async function buildGrounding(env: Env, userId: string): Promise<string> {
-  const [profile, plan, goal, checkins] = await Promise.all([
+  const today = new Date().toISOString().slice(0, 10);
+  const [profile, plan, goal, checkins, todayFood] = await Promise.all([
     sbGet(env, `profiles?user_id=eq.${userId}&select=nickname,birth_year`),
     sbGet(env, `fitness_plans?user_id=eq.${userId}&is_active=eq.true&select=plan`),
     sbGet(env, `fitness_goals?user_id=eq.${userId}&is_active=eq.true&select=primary_goal,target_weight_kg`),
-    sbGet(env, `daily_checkins?user_id=eq.${userId}&select=checkin_date,bodyweight_kg,energy&order=checkin_date.desc&limit=3`),
+    sbGet(env, `daily_checkins?user_id=eq.${userId}&select=checkin_date,bodyweight_kg,energy,sleep_hours,soreness&order=checkin_date.desc&limit=3`),
+    sbGet(env, `nutrition_logs?user_id=eq.${userId}&log_date=eq.${today}&select=calories,protein_g`),
   ]);
   const p = plan[0]?.plan as FitnessPlan | undefined;
   const prof = profile[0] as { nickname?: string } | undefined;
   const g = goal[0] as { primary_goal?: string; target_weight_kg?: number } | undefined;
+  const cks = checkins as { checkin_date: string; bodyweight_kg?: number; energy?: number; sleep_hours?: number; soreness?: number }[];
   const lines = [`USER: ${prof?.nickname ?? "user"}.`];
   if (g) lines.push(`GOAL: ${g.primary_goal}${g.target_weight_kg ? ` → ${g.target_weight_kg} kg` : ""}.`);
   if (p?.targets) lines.push(`PLAN: ${p.targets.calories} kcal, ${p.targets.proteinG} g protein; ${p.training?.splitName} ${p.training?.daysPerWeek}×/wk.`);
-  if (checkins.length) lines.push("RECENT: " + (checkins as { checkin_date: string; bodyweight_kg?: number }[]).map((c) => `${c.checkin_date}${c.bodyweight_kg ? ` ${c.bodyweight_kg}kg` : ""}`).join("; "));
+  const cal = (todayFood as { calories: number }[]).reduce((a, r) => a + Number(r.calories ?? 0), 0);
+  const prot = (todayFood as { protein_g: number }[]).reduce((a, r) => a + Number(r.protein_g ?? 0), 0);
+  lines.push(`TODAY EATEN: ${Math.round(cal)} kcal, ${Math.round(prot)} g protein.`);
+  const todayCk = cks.find((c) => c.checkin_date === today);
+  if (todayCk) {
+    const v = computeReadiness({ sleepHours: todayCk.sleep_hours ?? null, energy: todayCk.energy ?? null, soreness: todayCk.soreness ?? null });
+    if (v.band !== "unknown") lines.push(`TODAY READINESS: ${v.band} (${v.score}/100) — ${v.directive}`);
+  }
+  if (cks.length) lines.push("RECENT: " + cks.map((c) => `${c.checkin_date}${c.bodyweight_kg ? ` ${c.bodyweight_kg}kg` : ""}${c.sleep_hours ? ` ${c.sleep_hours}h` : ""}`).join("; "));
   return "CONTEXT (this user only):\n" + lines.join("\n");
 }
 

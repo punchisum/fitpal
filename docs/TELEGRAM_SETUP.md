@@ -30,14 +30,27 @@ curl "https://api.telegram.org/bot<TOKEN>/setWebhook" -H "Content-Type: applicat
 ## Commands
 - `/start` — new users: auto-creates account + starts onboarding. Existing: resumes / greets.
 - **📸 send a photo of a meal** — Gemini Vision estimates calories + macros and logs it (`source=photo`)
-- `/food 2 eggs and toast` — log food by text (Gemini estimate, `source=telegram`)
-- `/today` — today's food totals vs your targets
-- `/weight 80.5` — log today's bodyweight
-- `/plan` — current plan & targets
-- `/restart` — rebuild the plan from scratch (re-runs onboarding)
-- `/help` — command list
-- `/link CODE` — (optional) link to an account created on the web dashboard
-- any other text — grounded AI coaching (rate-limited, safety-gated)
+- `/food` (alias `/log`) `2 eggs and toast` — log food by text · `/undo` removes the last food log
+- `/today` — food vs targets + today's check-in + recovery readiness
+- `/checkin` — guided daily check-in (sleep, energy, soreness, mood, weight)
+- `/sleep 7.5` · `/energy 4` · `/soreness 3` · `/mood 4` — quick check-in logs
+- `/weight 80.5` — log weight · `/weight` (no arg) — weight trend
+- `/weekly` — 7-day review (workouts, sleep, calories, weight change)
+- `/plan` — current plan & targets · `/restart` — rebuild the plan
+- `/help` — command list · `/link CODE` — (optional) link a web-dashboard account
+- "should I train today?" — deterministic **recovery readiness** from today's check-in
+- any other text — grounded AI coaching (recovery-aware, rate-limited, safety-gated)
+
+## Recovery readiness (`lib/recovery.ts`)
+Deterministic verdict from the subjective check-in (sleep + energy + soreness) → score 0-100 → band
+(green/amber/red) → readiness (full/controlled/easy) + a directive. The public analog of HartOS's
+HRV/RHR recovery score (no wearable needed). The LLM only re-phrases it; it never decides it.
+Surfaced in `/today`, after each check-in, and for "should I train?". Unit-tested (`lib/recovery.test.ts`).
+
+## Owner notifications (optional)
+Set Worker secrets `ADMIN_BOT_TOKEN` (e.g. @HartOS_Command_Bot) + `ADMIN_CHAT_ID` to get a Telegram
+ping on every completed signup (name, goal, plan, total users). No-op if unset. Sent via a separate
+admin bot — keeps owner alerts off the public bot.
 
 ## Food logging (`src/worker/food.ts`)
 `estimateFood(apiKey, model, { text | imageBase64 })` calls Gemini (multimodal) and returns
