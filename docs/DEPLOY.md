@@ -1,6 +1,30 @@
 # Deploy — Fitpal
 
-Recommended host: **Vercel** (free tier is enough for beta; gives a free `*.vercel.app` domain — no purchase needed).
+## ✅ LIVE deployment (Cloudflare Workers via OpenNext)
+The app is deployed to Cloudflare Workers (uses the existing Cloudflare token — no Vercel needed):
+- **Web app:** https://fitpal-web.hartos.workers.dev
+- **Telegram bot:** https://fitpal-telegram.hartos.workers.dev (`@Fitpal_beta_bot`)
+
+Redeploy the web app:
+```bash
+export CLOUDFLARE_API_TOKEN=...   # from .env.local
+export CLOUDFLARE_ACCOUNT_ID=...
+npm run cf:build && npm run cf:deploy
+```
+Web worker secrets already set: `SUPABASE_SERVICE_ROLE_KEY`, `GEMINI_API_KEY`, `APP_ENCRYPTION_KEY`.
+Public vars (URL, anon key, app URL) live in `wrangler.jsonc`.
+
+### ⚠️ ONE required dashboard step before inviting friends
+Supabase → Authentication → URL Configuration:
+- **Site URL** = `https://fitpal-web.hartos.workers.dev`
+- **Redirect URLs** → add `https://fitpal-web.hartos.workers.dev/**` (keep `http://localhost:3000/**`).
+
+Without this, signup email-confirmation links bounce to localhost. Login still works regardless.
+
+---
+
+## Alternative host: Vercel
+Recommended if you prefer Vercel (free tier; free `*.vercel.app` domain).
 
 ## 1. Push to GitHub
 The repo is `punchisum/fitpal`. Commit and push (`.env.local` is gitignored and must NOT be committed).
