@@ -540,19 +540,41 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
       token = "ht_" + crypto.randomUUID().replace(/-/g, "");
       await sbPatch(env, "profiles", `user_id=eq.${userId}`, { health_ingest_token: token });
     }
+    const ingestUrl = `https://fitpal-telegram.hartos.workers.dev/health/ingest?token=${token}`;
     let watch = "";
     if (env.TERRA_DEV_ID && env.TERRA_API_KEY) {
       const url = await terraWidgetUrl(env.TERRA_DEV_ID, env.TERRA_API_KEY, userId);
-      if (url) watch = `\n⌚ Oura / Whoop / Garmin / Fitbit / Google Fit — tap to connect (no app):\n${url}\n`;
+      if (url) watch = `⌚ Got an Oura / Whoop / Garmin / Fitbit? Tap to connect (no app):\n${url}\n\n`;
     }
     await tgSend(env, chatId, [
-      "🛰️ Connect a wearable for real recovery (HRV, resting HR, sleep).",
-      watch,
-      "📱 Apple Health (iPhone) — add the Fitpal Health Sync shortcut, and paste this token when it asks:",
-      token,
+      "🛰️ Connect Apple Health — recovery from your real HRV & sleep.",
+      "Each morning your phone sends last night's heart + sleep data, so I judge recovery from real numbers (not just a check-in).",
       "",
-      "Once connected, /today judges your recovery from real data. No wearable? /checkin works great too.",
-    ].filter((l) => l !== "").join("\n"));
+      watch + "👇 YOUR PERSONAL SYNC LINK (keep it private):",
+      ingestUrl,
+      "",
+      "Now pick ONE of the two ways below to use that link. (On Apple Watch / Oura / Whoop? Their data is already in Apple Health, so either way works.)",
+    ].filter(Boolean).join("\n"));
+
+    await tgSend(env, chatId, [
+      "✅ EASIEST — the “Health Auto Export” app (App Store):",
+      "1. Open it → Automations → ➕ → REST API",
+      "2. URL: paste your link above",
+      "3. Method POST · Format JSON · Aggregate by day",
+      "4. Data: Heart Rate Variability, Resting Heart Rate, Sleep Analysis",
+      "5. Schedule Daily → Save. Done. ✅",
+      "",
+      "🆓 FREE — Apple Shortcut (5 min, one time):",
+      "Open Shortcuts → New Shortcut → add these 4 actions in order:",
+      "1) Find Health Samples → Heart Rate Variability · Limit 1 · Latest First → Set Variable “HRV”",
+      "2) Find Health Samples → Resting Heart Rate · Limit 1 · Latest First → Set Variable “RHR”",
+      "3) Text  →  {\"hrv_ms\": HRV, \"resting_hr\": RHR}   (insert the HRV & RHR variables)",
+      "4) Get Contents of URL → paste your link · Method POST · Header Content-Type = application/json · Request Body = the Text from step 3",
+      "",
+      "Tap ▶️ once → “Allow”. Then: Automations tab → ➕ → Time of Day → 7:00 AM Daily → run this shortcut. It now syncs by itself every morning.",
+      "",
+      "💤 Sleep: log it with /sleep 7.5 (or the Shortcut can add it later). No wearable at all? /checkin works great.",
+    ].join("\n"));
     return;
   }
   if (text.startsWith("/checkin")) {
