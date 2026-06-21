@@ -9,6 +9,7 @@ import { estimateFood, toBase64, FOOD_MODELS, type FoodEstimate, type FoodItem }
 import { computeReadiness } from "../../lib/recovery";
 import { parseHealthPayload } from "./health";
 import { terraWidgetUrl, verifyTerraSignature, parseTerraPayload } from "./terra";
+import { computeAdjustment, applyAdjustment } from "../../lib/plan/adjust";
 
 type Env = {
   TELEGRAM_BOT_TOKEN: string;
@@ -73,6 +74,12 @@ async function sbDelete(env: Env, table: string, filter: string): Promise<boolea
   return r.ok;
 }
 function daysAgo(n: number): string { const d = new Date(); d.setUTCDate(d.getUTCDate() - n); return d.toISOString().slice(0, 10); }
+function isoWeekMonday(): string {
+  const d = new Date();
+  const day = d.getUTCDay(); // 0 Sun..6 Sat
+  d.setUTCDate(d.getUTCDate() + (day === 0 ? -6 : 1 - day));
+  return d.toISOString().slice(0, 10);
+}
 async function sbRpc<T>(env: Env, fn: string, body: Record<string, unknown>): Promise<T | null> {
   const r = await fetch(`${env.SUPABASE_URL}/rest/v1/rpc/${fn}`, { method: "POST", headers: sbHeaders(env), body: JSON.stringify(body) });
   if (!r.ok) return null;
@@ -114,6 +121,12 @@ async function tgAnswerCallback(env: Env, callbackId: string, text?: string): Pr
     body: JSON.stringify({ callback_query_id: callbackId, ...(text ? { text } : {}) }),
   });
 }
+async function tgSendPhoto(env: Env, chatId: number | string, photoUrl: string, caption?: string): Promise<void> {
+  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, photo: photoUrl, ...(caption ? { caption } : {}) }),
+  });
+}
 
 // ── Gemini ──
 async function gemini(env: Env, system: string, history: { role: string; content: string }[], userText: string): Promise<string> {
@@ -140,25 +153,48 @@ async function gemini(env: Env, system: string, history: { role: string; content
     : "I'm having trouble reaching my coaching brain right now — try again in a moment.";
 }
 
+// Transcribe a Telegram voice note (OGG/Opus) via Gemini audio + classify food-logging intent.
+async function transcribeVoice(env: Env, audioBase64: string, model: string): Promise<{ transcript: string; intent: "food" | "other"; foodText: string | null } | null> {
+  const prompt = 'Transcribe this voice note from a fitness app user, then classify intent. Respond ONLY JSON: {"transcript": string, "intent": "food"|"other", "food_text": string|null}. Use intent "food" only if they are logging/describing food or drink they ate; food_text = just the food description. Otherwise "other".';
+  for (const m of [...new Set([model, ...FOOD_MODELS])]) {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${env.GEMINI_API_KEY}`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }, { inline_data: { mime_type: "audio/ogg", data: audioBase64 } }] }], generationConfig: { temperature: 0.2, responseMimeType: "application/json" } }),
+    });
+    if (r.status === 429) continue;
+    if (!r.ok) continue;
+    const j = (await r.json()) as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
+    const raw = (j.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "").replace(/```json/gi, "").replace(/```/g, "").trim();
+    try {
+      const o = JSON.parse(raw) as { transcript?: unknown; intent?: unknown; food_text?: unknown };
+      return { transcript: String(o.transcript || ""), intent: o.intent === "food" ? "food" : "other", foodText: typeof o.food_text === "string" ? o.food_text : null };
+    } catch { return null; }
+  }
+  return null;
+}
+
 const HELP = [
   "Here's what I can do:",
   "",
   "🍽️ Food",
-  "📸 Send a meal photo — I'll log the calories",
-  "/food 2 eggs and toast — log food by text",
-  "/today — today's food, check-in & readiness",
+  "📸 Photo / 🎙️ voice note — I'll log it",
+  "/food 2 eggs and toast — log by text",
+  "/barcode 0123… — scan a packaged food",
+  "/again — re-log your last meal",
+  "/today — food, check-in & readiness",
   "/undo — remove your last food log",
   "",
   "🛌 Recovery & check-in",
   "/connect — sync Apple Health (HRV, RHR, sleep)",
   "/checkin — guided sleep/energy/soreness/weight",
-  "/sleep 7.5 — log last night's sleep",
-  "/energy 4 · /soreness 3 · /mood 4 (1–5)",
+  "/sleep 7.5 · /energy 4 · /soreness 3 · /mood 4",
   "/weight 80.5 — log bodyweight",
   "",
   "📈 Plan & progress",
   "/plan — your plan & targets",
-  "/weekly — your 7-day review",
+  "/review — let me tune your plan from your results",
+  "/chart — your weight trend (image)",
+  "/weekly — 7-day review · /streak — your streak 🔥",
   "/restart — rebuild your plan",
   "",
   "Or ask me anything (\"should I train today?\") and I'll coach you.",
@@ -298,6 +334,31 @@ async function foodSummaryLine(env: Env, userId: string): Promise<string> {
     ? `\n\nToday: ${Math.round(cal)}/${t.calories} kcal · ${Math.round(prot)}/${t.proteinG}g protein (${rows.length} item${rows.length === 1 ? "" : "s"}).`
     : `\n\nToday: ${Math.round(cal)} kcal · ${Math.round(prot)}g protein.`;
 }
+
+// Consecutive days (ending today/yesterday) with ANY activity logged — the retention streak.
+async function logStreak(env: Env, userId: string): Promise<number> {
+  const since = daysAgo(90);
+  const [ck, nut, wk] = await Promise.all([
+    sbGet(env, `daily_checkins?user_id=eq.${userId}&checkin_date=gte.${since}&select=checkin_date`),
+    sbGet(env, `nutrition_logs?user_id=eq.${userId}&log_date=gte.${since}&select=log_date`),
+    sbGet(env, `workout_logs?user_id=eq.${userId}&workout_date=gte.${since}&select=workout_date`),
+  ]);
+  const days = new Set<string>();
+  for (const r of ck) days.add(r.checkin_date as string);
+  for (const r of nut) days.add(r.log_date as string);
+  for (const r of wk) days.add(r.workout_date as string);
+  const iso = (d: Date) => d.toISOString().slice(0, 10);
+  const d = new Date();
+  if (!days.has(iso(d))) d.setUTCDate(d.getUTCDate() - 1); // today not logged yet → count from yesterday
+  let streak = 0;
+  while (days.has(iso(d))) { streak++; d.setUTCDate(d.getUTCDate() - 1); }
+  return streak;
+}
+function streakLine(n: number): string {
+  if (n <= 0) return "";
+  const fire = n >= 3 ? "🔥" : "✨";
+  return `\n\n${fire} ${n}-day streak${n >= 7 ? " — on fire!" : n >= 3 ? " — keep it going!" : "."}`;
+}
 function foodReply(m: FoodEstimate, summary: string): string {
   if (!m.items?.length) return "That doesn't look like food 🤔 Send a photo of a meal, or try /food <what you ate>.";
   const items = m.items.map((i) => `• ${i.name} ~${i.grams}g — ${i.calories} kcal`).join("\n");
@@ -375,12 +436,32 @@ async function handleCallback(env: Env, cb: Record<string, unknown>): Promise<vo
   const chatId = message?.chat?.id;
   const messageId = message?.message_id;
   const fromId = from?.id != null ? String(from.id) : undefined;
-  if (!data.startsWith("fd:") || chatId == null || messageId == null || !fromId) { if (cbId) await tgAnswerCallback(env, cbId); return; }
+  if (chatId == null || messageId == null || !fromId || !(data.startsWith("fd:") || data.startsWith("pp:"))) { if (cbId) await tgAnswerCallback(env, cbId); return; }
 
   const [, action, idStr] = data.split(":");
-  const id = Number(idStr);
   const userId = await sbRpc<string | null>(env, "resolve_telegram_user", { p_telegram_user_id: fromId });
   if (!userId || typeof userId !== "string") { await tgAnswerCallback(env, cbId, "Please /start first."); return; }
+
+  // ── Plan-review proposal (pp:) ──
+  if (data.startsWith("pp:")) {
+    const rows = await sbGet(env, `plan_adjustment_proposals?id=eq.${idStr}&user_id=eq.${userId}&status=eq.pending&select=id,proposed_change&limit=1`);
+    const prop = rows[0] as { id: string; proposed_change: FitnessPlan } | undefined;
+    if (!prop) { await tgAnswerCallback(env, cbId, "Review expired"); await tgEdit(env, chatId, messageId, "⌛ This review expired — send /review again."); return; }
+    if (action === "ok") {
+      const planId = await sbRpc<string>(env, "activate_fitness_plan_for", { p_user_id: userId, p_plan: prop.proposed_change, p_source: "deterministic" });
+      await sbPatch(env, "plan_adjustment_proposals", `id=eq.${idStr}`, { status: "applied", decided_at: new Date().toISOString(), applied_plan_id: planId });
+      await tgAnswerCallback(env, cbId, "Applied ✓");
+      await tgEdit(env, chatId, messageId, `✅ Plan updated — new target ${prop.proposed_change.targets.calories} kcal/day. Send /plan to see it.`);
+    } else {
+      await sbPatch(env, "plan_adjustment_proposals", `id=eq.${idStr}`, { status: "rejected", decided_at: new Date().toISOString() });
+      await tgAnswerCallback(env, cbId, "Kept current");
+      await tgEdit(env, chatId, messageId, "👍 Kept your current plan.");
+    }
+    return;
+  }
+
+  // ── Food draft (fd:) ──
+  const id = Number(idStr);
   const draft = await getDraft(env, id, userId);
   if (!draft) { await tgAnswerCallback(env, cbId, "Draft expired"); await tgEdit(env, chatId, messageId, "⌛ This food draft expired — send it again."); return; }
 
@@ -408,9 +489,10 @@ async function handleCallback(env: Env, cb: Record<string, unknown>): Promise<vo
 }
 
 async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<void> {
-  const msg = update.message as { text?: string; caption?: string; photo?: { file_id: string }[]; chat?: { id: number }; from?: { id: number } } | undefined;
-  const text = msg?.text?.trim();
+  const msg = update.message as { text?: string; caption?: string; photo?: { file_id: string }[]; voice?: { file_id: string }; chat?: { id: number }; from?: { id: number } } | undefined;
+  let text = msg?.text?.trim();
   const photos = msg?.photo;
+  const voice = msg?.voice;
   const caption = msg?.caption?.trim();
   const chatId = msg?.chat?.id;
   const fromId = msg?.from?.id != null ? String(msg.from.id) : undefined;
@@ -436,6 +518,21 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
     }
     await sendFoodDraft(env, chatId, identity.user_id, res.estimate, "photo", analysingId);
     return;
+  }
+
+  // ── Voice note → transcribe + route (food log or coaching). Treated as if typed. ──
+  if (voice && !text) {
+    const path = await tgFilePath(env, voice.file_id);
+    const buf = path ? await tgDownload(env, path) : null;
+    if (buf) {
+      const v = await transcribeVoice(env, toBase64(buf), model);
+      if (v && v.transcript) {
+        text = v.intent === "food" && v.foodText ? `/food ${v.foodText}` : v.transcript;
+      } else {
+        await tgSend(env, chatId, "🎙️ I couldn't make out that voice note — try again, or type it.");
+        return;
+      }
+    }
   }
 
   if (!text) return;
@@ -516,7 +613,7 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
       for (const [k, v] of Object.entries(answers)) if (v !== null && v !== undefined) fields[k] = v;
       await upsertCheckin(env, userId, fields);
       await setCheckinState(env, fromId, 0, {});
-      await tgSend(env, chatId, "✅ Check-in saved!" + (await readinessLine(env, userId)));
+      await tgSend(env, chatId, "✅ Check-in saved!" + (await readinessLine(env, userId)) + streakLine(await logStreak(env, userId)));
       return;
     }
     await setCheckinState(env, fromId, cstep + 1, answers);
@@ -634,11 +731,55 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
     await sendFoodDraft(env, chatId, userId, res.estimate, "telegram");
     return;
   }
+  if (text.startsWith("/barcode")) {
+    const code = (text.split(/\s+/)[1] ?? "").replace(/\D/g, "");
+    if (!code) { await tgSend(env, chatId, "Send the number under the barcode, e.g. /barcode 0123456789012"); return; }
+    const r = await fetch(`https://world.openfoodfacts.org/api/v2/product/${code}.json?fields=product_name,nutriments,serving_size,serving_quantity`, { headers: { "User-Agent": "Fitpal/1.0" } });
+    const j = (await r.json().catch(() => null)) as { status?: number; product?: { product_name?: string; serving_size?: string; serving_quantity?: number; nutriments?: Record<string, number> } } | null;
+    if (!j || j.status !== 1 || !j.product) { await tgSend(env, chatId, "Couldn't find that barcode 🤔 Try /food <name> or send a photo of the label."); return; }
+    const p = j.product, n = p.nutriments ?? {};
+    const servingG = Number(p.serving_quantity) > 0 ? Number(p.serving_quantity) : 100;
+    const f = servingG / 100;
+    const cal = Math.round(Number(n["energy-kcal_100g"] ?? 0) * f);
+    if (cal <= 0) { await tgSend(env, chatId, "Found it, but no nutrition data for that product. Try /food <name>."); return; }
+    const name = (p.product_name || "item") + (p.serving_size ? ` (${p.serving_size})` : "");
+    const item: FoodItem = { name: p.product_name || "item", grams: Math.round(servingG), calories: cal, protein_g: Math.round(Number(n.proteins_100g ?? 0) * f), carbs_g: Math.round(Number(n.carbohydrates_100g ?? 0) * f), fat_g: Math.round(Number(n.fat_100g ?? 0) * f) };
+    const est: FoodEstimate = { description: name, items: [item], calories: cal, protein_g: item.protein_g, carbs_g: item.carbs_g, fat_g: item.fat_g, confidence: "high" };
+    await sendFoodDraft(env, chatId, userId, est, "telegram");
+    return;
+  }
   if (text.startsWith("/undo")) {
     const rows = await sbGet(env, `nutrition_logs?user_id=eq.${userId}&select=id,description&order=created_at.desc&limit=1`);
     if (!rows.length) { await tgSend(env, chatId, "Nothing to undo."); return; }
     await sbDelete(env, "nutrition_logs", `id=eq.${rows[0].id}`);
     await tgSend(env, chatId, `↩️ Removed: ${rows[0].description ?? "last food log"}.${await foodSummaryLine(env, userId)}`);
+    return;
+  }
+  if (text.startsWith("/again")) {
+    const rows = await sbGet(env, `nutrition_logs?user_id=eq.${userId}&select=description,items,calories,protein_g,carbs_g,fat_g,confidence&order=created_at.desc&limit=1`);
+    const last = rows[0];
+    if (!last) { await tgSend(env, chatId, "Nothing to re-log yet — log a meal first with /food or a photo."); return; }
+    const est: FoodEstimate = { description: String(last.description ?? "meal"), items: (last.items as FoodItem[]) ?? [], calories: Number(last.calories ?? 0), protein_g: Number(last.protein_g ?? 0), carbs_g: Number(last.carbs_g ?? 0), fat_g: Number(last.fat_g ?? 0), confidence: (last.confidence as FoodEstimate["confidence"]) ?? "low" };
+    await logFood(env, userId, est, "telegram");
+    await tgSend(env, chatId, `🔁 Re-logged: ${est.description}${await foodSummaryLine(env, userId)}`);
+    return;
+  }
+  if (text.startsWith("/streak")) {
+    const n = await logStreak(env, userId);
+    await tgSend(env, chatId, n > 0
+      ? `${streakLine(n).trim()}\n\nLog something every day (food, /checkin, or a workout) to keep it alive.`
+      : "No streak yet — log a meal, a /checkin, or a workout today to start one. 🔥");
+    return;
+  }
+  if (text.startsWith("/chart")) {
+    const rows = await sbGet(env, `daily_checkins?user_id=eq.${userId}&bodyweight_kg=not.is.null&checkin_date=gte.${daysAgo(90)}&select=checkin_date,bodyweight_kg&order=checkin_date.asc`) as { checkin_date: string; bodyweight_kg: number }[];
+    if (rows.length < 2) { await tgSend(env, chatId, "Log your weight a few times (/weight 80.5) and I'll chart your trend. 📈"); return; }
+    const labels = rows.map((r) => r.checkin_date.slice(5));
+    const data = rows.map((r) => Number(r.bodyweight_kg));
+    const cfg = { type: "line", data: { labels, datasets: [{ label: "kg", data, borderColor: "rgb(16,185,129)", backgroundColor: "rgba(16,185,129,0.12)", fill: true, tension: 0.3, pointRadius: 2 }] }, options: { plugins: { legend: { display: false }, title: { display: true, text: "Weight trend (kg)" } } } };
+    const url = `https://quickchart.io/chart?w=540&h=320&bkg=white&c=${encodeURIComponent(JSON.stringify(cfg))}`;
+    const delta = Number((data[data.length - 1] - data[0]).toFixed(1));
+    await tgSendPhoto(env, chatId, url, `📈 Weight — ${delta > 0 ? "+" : ""}${delta} kg over ${rows.length} weigh-ins`);
     return;
   }
   if (text.startsWith("/today")) {
@@ -652,6 +793,7 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
       body += "\n\nNo check-in yet — /checkin or /sleep 7.5";
     }
     body += await readinessLine(env, userId);
+    body += streakLine(await logStreak(env, userId));
     await tgSend(env, chatId, body);
     return;
   }
@@ -680,6 +822,35 @@ async function handleUpdate(env: Env, update: Record<string, unknown>): Promise<
       wk.length >= 3 ? "Strong week 💪 keep the streak going." : "Aim for a couple more sessions next week — consistency wins.",
     ];
     await tgSend(env, chatId, lines.join("\n"));
+    return;
+  }
+  if (text.startsWith("/review")) {
+    const planRows = await sbGet(env, `fitness_plans?user_id=eq.${userId}&is_active=eq.true&select=plan`);
+    const plan = planRows[0]?.plan as FitnessPlan | undefined;
+    if (!plan) { await tgSend(env, chatId, "No active plan to review yet. /restart to build one."); return; }
+    const wRows = await sbGet(env, `daily_checkins?user_id=eq.${userId}&bodyweight_kg=not.is.null&checkin_date=gte.${daysAgo(21)}&select=checkin_date,bodyweight_kg&order=checkin_date.asc`);
+    const adj = computeAdjustment(plan, (wRows as { checkin_date: string; bodyweight_kg: number }[]).map((r) => ({ date: r.checkin_date, kg: Number(r.bodyweight_kg) })));
+    if (!adj) {
+      await tgSend(env, chatId, "📋 Weekly review: your plan looks on track — no change needed. Keep logging your weight a couple times a week (/weight 80.5) so I can fine-tune. 💪");
+      return;
+    }
+    const newPlan = applyAdjustment(plan, adj);
+    const weekKey = "review:" + isoWeekMonday();
+    const existing = await sbGet(env, `plan_adjustment_proposals?user_id=eq.${userId}&idempotency_key=eq.${weekKey}&status=eq.pending&select=id&limit=1`);
+    let pid = existing[0]?.id as string | undefined;
+    if (pid) {
+      await sbPatch(env, "plan_adjustment_proposals", `id=eq.${pid}`, { proposed_change: newPlan, rationale: adj.rationale });
+    } else {
+      const r = await fetch(`${env.SUPABASE_URL}/rest/v1/plan_adjustment_proposals`, {
+        method: "POST", headers: { ...sbHeaders(env), Prefer: "return=representation" },
+        body: JSON.stringify({ user_id: userId, proposed_change: newPlan, rationale: adj.rationale, source: "deterministic", idempotency_key: weekKey, status: "pending" }),
+      });
+      pid = r.ok ? ((await r.json()) as { id: string }[])[0]?.id : undefined;
+    }
+    if (!pid) { await tgSend(env, chatId, "Couldn't prepare the review — try again in a bit."); return; }
+    await tgSend(env, chatId, `📋 Weekly review\n\n${adj.rationale}\n\nApply this change?`, {
+      inline_keyboard: [[{ text: "✅ Apply", callback_data: `pp:ok:${pid}` }, { text: "✖ Keep current", callback_data: `pp:no:${pid}` }]],
+    });
     return;
   }
 
